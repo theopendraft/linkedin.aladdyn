@@ -121,16 +121,21 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     );
   }
 
-  // Eligible = most recent message in DB is INBOUND (they sent last, we haven't replied).
-  // messages are ordered createdAt desc, so [0] = most recently inserted.
-  // Our OUTBOUND reply (saved after sendDM) has createdAt=now → becomes [0] → breaks the
-  // loop. Their follow-up has an even newer createdAt → becomes [0] as INBOUND → eligible.
+  // Eligible = they have sent a message we haven't replied to yet.
+  // Primary check: messages[0] (most recently stored, createdAt desc) is INBOUND.
+  // Fallback: LinkedIn sidebar reports unread > 0. This handles cases where the new
+  // INBOUND message was stored with a slightly older parsed timestamp (LinkedIn shows
+  // relative times like "3:16 PM" which parseLinkedInTime can misplace by hours),
+  // causing it to land at messages[1] instead of [0]. After we reply, autoReply sets
+  // unreadCount=0 in DB and inboxReader navigated the thread (LinkedIn marks it read),
+  // so the next sync reads 0 from the sidebar — no double-reply risk.
   const eligible = conversations.filter((conv) => {
     if (conv.messages.length === 0) return false;
-    return conv.messages[0].direction === 'INBOUND';
+    if (conv.messages[0].direction === 'INBOUND') return true;
+    return (conv.unreadCount ?? 0) > 0;
   });
 
-  console.log(`[AutoReply] ${eligible.length}/${conversations.length} eligible (messages[0]=INBOUND)`);
+  console.log(`[AutoReply] ${eligible.length}/${conversations.length} eligible (messages[0]=INBOUND or unreadCount>0)`);
   for (const conv of eligible) {
     const lastInbound = [...conv.messages].reverse().find((m) => m.direction === 'INBOUND');
     console.log(
