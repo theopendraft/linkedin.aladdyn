@@ -121,28 +121,23 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     );
   }
 
-  // Eligible = they sent a message after our last reply.
-  // Primary: most recently stored message (createdAt desc → [0]) is INBOUND.
-  // Fallback: LinkedIn sidebar unreadCount > 0, BUT only if there is an INBOUND
-  // message in DB that is newer than lastAutoReplyAt. Without this guard the fallback
-  // fires every cycle because LinkedIn's sidebar CSS-class unread detection is
-  // unreliable — it can stay "unread" permanently after headless navigation, causing
-  // an infinite reply loop until the daily limit is exhausted.
+  // Eligible = most recently stored message is INBOUND.
+  //
+  // count-based dedup (inboxReader) inserts every new INBOUND with createdAt=now(),
+  // so the newest message in DB is always the most recently received one.
+  // After we reply, the OUTBOUND is stored with createdAt=now() > any prior INBOUND,
+  // so messages[0] flips back to OUTBOUND and the conversation becomes ineligible.
+  // When they send a new message it's inserted with a fresh createdAt > our OUTBOUND
+  // → messages[0] is INBOUND again → eligible.
+  //
+  // The unreadCount fallback was removed: LinkedIn's CSS-based hasUnread stays true
+  // permanently after headless navigation, causing infinite reply loops.
   const eligible = conversations.filter((conv) => {
     if (conv.messages.length === 0) return false;
-    if (conv.messages[0].direction === 'INBOUND') return true;
-    if ((conv.unreadCount ?? 0) > 0) {
-      // Find newest INBOUND in the messages window (DESC order → .find gives newest)
-      const newestInbound = conv.messages.find(m => m.direction === 'INBOUND');
-      if (!newestInbound) return false;
-      // Only trigger if the newest INBOUND arrived AFTER our last reply
-      if (conv.lastAutoReplyAt && newestInbound.createdAt <= conv.lastAutoReplyAt) return false;
-      return true;
-    }
-    return false;
+    return conv.messages[0].direction === 'INBOUND';
   });
 
-  console.log(`[AutoReply] ${eligible.length}/${conversations.length} eligible (messages[0]=INBOUND or unreadCount>0 with new msg)`);
+  console.log(`[AutoReply] ${eligible.length}/${conversations.length} eligible (messages[0]=INBOUND)`);
   for (const conv of eligible) {
     const newestInbound = conv.messages.find((m) => m.direction === 'INBOUND');
     console.log(
@@ -219,11 +214,11 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
           lastAutoReplyAt: new Date(),
           autoReplyCount: { increment: 1 },
           unreadCount: 0,
-          // Persist genie conversation ID on first reply so future replies
-          // continue the same thread in genie (preserves full history)
-          ...(returnedConvId && !conv.genieConversationId
-            ? { genieConversationId: returnedConvId }
-            : {}),
+          // Always persist the latest genie conversation ID.
+          // On first reply this bootstraps the thread; on subsequent replies it
+          // handles genie conversation expiry/reset (new ID returned → update so
+          // future replies continue with a live context, not a dead one).
+          ...(returnedConvId ? { genieConversationId: returnedConvId } : {}),
         },
       });
 

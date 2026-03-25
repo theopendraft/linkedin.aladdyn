@@ -369,7 +369,10 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
         participantProfileUrl: conv.participantProfileUrl,
         lastMessageAt: conv.lastMessageAt,
         lastMessageSnippet: conv.lastMessageSnippet,
-        unreadCount: conv.unreadCount,
+        // Do NOT sync unreadCount from DOM — LinkedIn's CSS-based hasUnread detection
+        // stays true permanently after headless navigation and would overwrite the
+        // unreadCount: 0 that autoReply sets after sending, causing infinite reply loops.
+        // unreadCount is managed solely by autoReply (sets 0) and conversation create (sets from DOM).
         ...(account.autoReplyEnabled ? { autoReplyEnabled: true } : {}),
       },
     });
