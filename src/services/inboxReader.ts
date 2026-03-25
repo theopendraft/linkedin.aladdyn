@@ -374,12 +374,14 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
       },
     });
 
-    // Upsert messages — deduplicate by content + direction only.
+    // Upsert messages — deduplicate by content + direction.
     // We do NOT use sentAt for deduplication because LinkedIn's DOM timestamps
-    // are relative strings ("3:16 AM", "Yesterday") that parse inconsistently
-    // across syncs — empty timestamps produce sentAt=now() which changes each time.
-    // Content + direction is sufficient: the same message content from the same
-    // participant won't appear twice unless they literally typed the same thing twice.
+    // are relative strings ("3:16 AM", "Yesterday") that parse inconsistently.
+    //
+    // Special case for INBOUND: if the same content exists in DB but was stored
+    // BEFORE our last auto-reply, the participant may have sent it AGAIN after
+    // receiving our reply. Re-insert it as a fresh record so the eligibility
+    // check (messages[0]=INBOUND) fires correctly on the next auto-reply cycle.
     for (const msg of conv.messages) {
       const existing = await prisma.linkedInMessage.findFirst({
         where: {
@@ -387,9 +389,16 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
           direction: msg.direction,
           content: msg.content,
         },
+        orderBy: { createdAt: 'desc' },
       });
 
-      if (!existing) {
+      const isRepeatAfterReply =
+        msg.direction === 'INBOUND' &&
+        existing !== null &&
+        upserted.lastAutoReplyAt !== null &&
+        existing.createdAt < upserted.lastAutoReplyAt;
+
+      if (!existing || isRepeatAfterReply) {
         await prisma.linkedInMessage.create({
           data: {
             conversationId: upserted.id,
