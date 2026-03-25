@@ -568,10 +568,11 @@ export async function sendDM(params: {
     await input.click();
     await randomDelay(500, 1000);
 
-    // Type the message with human-like speed
-    await input.pressSequentially(message, {
-      delay: Math.floor(Math.random() * 50) + 30,
-    });
+    // Use fill() to set the full message text at once — much faster than
+    // pressSequentially character-by-character, which times out on long messages
+    // (400 chars × 50ms = 20s+). fill() triggers proper input events on
+    // LinkedIn's contenteditable div and completes in milliseconds.
+    await input.fill(message);
 
     await randomDelay(800, 1500);
 

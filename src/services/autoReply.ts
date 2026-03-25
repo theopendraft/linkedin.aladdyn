@@ -237,6 +237,14 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
         `[AutoReply] Failed to reply to conversation ${conv.id}:`,
         err instanceof Error ? err.message : String(err)
       );
+      // Update lastAutoReplyAt even on failure so this conversation is not
+      // retried every cycle until Pankaj sends a genuinely new message.
+      // Without this, a persistent send failure (e.g. typing timeout) keeps
+      // the conversation eligible forever → same error repeats on every sync.
+      await prisma.linkedInConversation.update({
+        where: { id: conv.id },
+        data: { lastAutoReplyAt: new Date() },
+      }).catch(() => {});
       skipped++;
     }
   }
