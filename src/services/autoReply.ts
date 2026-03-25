@@ -121,27 +121,34 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     );
   }
 
-  // Eligible = they have sent a message we haven't replied to yet.
-  // Primary check: messages[0] (most recently stored, createdAt desc) is INBOUND.
-  // Fallback: LinkedIn sidebar reports unread > 0. This handles cases where the new
-  // INBOUND message was stored with a slightly older parsed timestamp (LinkedIn shows
-  // relative times like "3:16 PM" which parseLinkedInTime can misplace by hours),
-  // causing it to land at messages[1] instead of [0]. After we reply, autoReply sets
-  // unreadCount=0 in DB and inboxReader navigated the thread (LinkedIn marks it read),
-  // so the next sync reads 0 from the sidebar — no double-reply risk.
+  // Eligible = they sent a message after our last reply.
+  // Primary: most recently stored message (createdAt desc → [0]) is INBOUND.
+  // Fallback: LinkedIn sidebar unreadCount > 0, BUT only if there is an INBOUND
+  // message in DB that is newer than lastAutoReplyAt. Without this guard the fallback
+  // fires every cycle because LinkedIn's sidebar CSS-class unread detection is
+  // unreliable — it can stay "unread" permanently after headless navigation, causing
+  // an infinite reply loop until the daily limit is exhausted.
   const eligible = conversations.filter((conv) => {
     if (conv.messages.length === 0) return false;
     if (conv.messages[0].direction === 'INBOUND') return true;
-    return (conv.unreadCount ?? 0) > 0;
+    if ((conv.unreadCount ?? 0) > 0) {
+      // Find newest INBOUND in the messages window (DESC order → .find gives newest)
+      const newestInbound = conv.messages.find(m => m.direction === 'INBOUND');
+      if (!newestInbound) return false;
+      // Only trigger if the newest INBOUND arrived AFTER our last reply
+      if (conv.lastAutoReplyAt && newestInbound.createdAt <= conv.lastAutoReplyAt) return false;
+      return true;
+    }
+    return false;
   });
 
-  console.log(`[AutoReply] ${eligible.length}/${conversations.length} eligible (messages[0]=INBOUND or unreadCount>0)`);
+  console.log(`[AutoReply] ${eligible.length}/${conversations.length} eligible (messages[0]=INBOUND or unreadCount>0 with new msg)`);
   for (const conv of eligible) {
-    const lastInbound = [...conv.messages].reverse().find((m) => m.direction === 'INBOUND');
+    const newestInbound = conv.messages.find((m) => m.direction === 'INBOUND');
     console.log(
       `[AutoReply]   → conv=${conv.id} participant=${conv.participantLinkedInId} ` +
       `lastAutoReplyAt=${conv.lastAutoReplyAt ?? 'never'} ` +
-      `lastInbound.createdAt=${lastInbound?.createdAt ?? 'none'}`
+      `newestInbound.createdAt=${newestInbound?.createdAt ?? 'none'}`
     );
   }
 
@@ -162,10 +169,14 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     }
 
     try {
-      // Find the last inbound message to use as the query for genie
-      // (messages are ordered desc, so reverse to find oldest-first context)
-      const sortedMessages = [...conv.messages].reverse();
-      const lastInbound = sortedMessages.findLast((m) => m.direction === 'INBOUND');
+      // Fetch the actual latest INBOUND from DB — do not rely on conv.messages
+      // which is capped at MAX_HISTORY_MESSAGES. If accumulated OUTBOUND replies
+      // pushed the real latest INBOUND out of that window, we'd send genie an old
+      // stale message as the query, producing repeated identical replies.
+      const lastInbound = await prisma.linkedInMessage.findFirst({
+        where: { conversationId: conv.id, direction: 'INBOUND' },
+        orderBy: { createdAt: 'desc' },
+      });
 
       if (!lastInbound) {
         skipped++;
