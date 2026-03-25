@@ -102,33 +102,51 @@ export async function startMessageWatcher(accountId: string): Promise<void> {
   const { page } = session;
 
   // ── WebSocket interception ────────────────────────────────────────────────
-  // LinkedIn's realtime WebSocket delivers new message events. Any inbound
-  // frame = potential new message → trigger debounced sync.
+  // Log ALL websockets so we can identify LinkedIn's actual realtime URL,
+  // then attach framereceived listener to any that look like realtime sockets.
   page.on('websocket', (ws) => {
     const url = ws.url();
+    console.log(`[MessageWatcher] WebSocket opened for ${accountId}: ${url}`);
+
     const isRealtimeSocket =
       url.includes('realtime.www.linkedin.com') ||
       url.includes('push.linkedin.com') ||
       url.includes('livefyre') ||
-      url.includes('realtime');
+      url.includes('realtime') ||
+      url.includes('linkedin.com');  // catch-all: attach to any LinkedIn WS
 
     if (!isRealtimeSocket) return;
 
-    console.log(`[MessageWatcher] Realtime WebSocket connected for ${accountId}: ${url}`);
-
-    ws.on('framereceived', () => {
+    ws.on('framereceived', ({ payload }) => {
+      // Skip tiny heartbeat frames (< 10 bytes) — they are keepalive pings
+      if (typeof payload === 'string' && payload.length < 10) return;
+      if (payload instanceof Buffer && payload.length < 10) return;
+      console.log(`[MessageWatcher] WS frame received for ${accountId} (${url})`);
       scheduleSync(accountId);
     });
 
     ws.on('close', () => {
-      console.log(`[MessageWatcher] Realtime WebSocket closed for ${accountId}`);
+      console.log(`[MessageWatcher] WebSocket closed for ${accountId}: ${url}`);
     });
   });
 
-  // HTTP response interception intentionally removed — too noisy.
-  // LinkedIn's messaging page fires dozens of /voyager/api/messaging/ requests
-  // per minute for presence, read receipts, typing, etc. The realtime WebSocket
-  // above is sufficient to detect actual new messages.
+  // ── HTTP realtime fallback ─────────────────────────────────────────────────
+  // LinkedIn's push channel may arrive via SSE rather than WebSocket.
+  // Only trigger on server-initiated realtime endpoints, NOT voyager API calls
+  // (voyager is page-initiated and fires constantly for presence/typing/etc).
+  // The jobId deduplication in scheduleSync prevents queue flooding even if
+  // this fires many times.
+  page.on('response', (response) => {
+    const url = response.url();
+    if (
+      url.includes('/realtime/connect') ||
+      url.includes('realtime.www.linkedin.com') ||
+      url.includes('push.linkedin.com')
+    ) {
+      console.log(`[MessageWatcher] Realtime HTTP response for ${accountId}: ${url}`);
+      scheduleSync(accountId);
+    }
+  });
 
   // ── Session health monitor ────────────────────────────────────────────────
   page.on('framenavigated', async (frame) => {
