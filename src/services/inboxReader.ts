@@ -374,37 +374,41 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
       },
     });
 
-    // Upsert messages — deduplicate by content + direction.
-    // We do NOT use sentAt for deduplication because LinkedIn's DOM timestamps
-    // are relative strings ("3:16 AM", "Yesterday") that parse inconsistently.
+    // Count-based message deduplication.
     //
-    // Special case for INBOUND: if the same content exists in DB but was stored
-    // BEFORE our last auto-reply, the participant may have sent it AGAIN after
-    // receiving our reply. Re-insert it as a fresh record so the eligibility
-    // check (messages[0]=INBOUND) fires correctly on the next auto-reply cycle.
+    // LinkedIn renders the full thread on every navigation, so a simple
+    // "does this content exist?" check would prevent detecting repeated messages
+    // (e.g. participant says "Hello" twice after getting a reply). Instead we
+    // compare the DOM occurrence count vs the DB record count for each unique
+    // content+direction pair and insert only the difference. Each genuinely new
+    // occurrence gets a fresh createdAt so messages[0]=INBOUND fires correctly.
+    const domCounts = new Map<string, number>();
+    const domExamples = new Map<string, MessageData>();
+
     for (const msg of conv.messages) {
-      const existing = await prisma.linkedInMessage.findFirst({
-        where: {
-          conversationId: upserted.id,
-          direction: msg.direction,
-          content: msg.content,
-        },
-        orderBy: { createdAt: 'desc' },
+      const key = `${msg.direction}\0${msg.content}`;
+      domCounts.set(key, (domCounts.get(key) ?? 0) + 1);
+      if (!domExamples.has(key)) domExamples.set(key, msg);
+    }
+
+    for (const [key, domCount] of domCounts) {
+      const sep = key.indexOf('\0');
+      const direction = key.slice(0, sep) as 'INBOUND' | 'OUTBOUND';
+      const content = key.slice(sep + 1);
+      const example = domExamples.get(key)!;
+
+      const dbCount = await prisma.linkedInMessage.count({
+        where: { conversationId: upserted.id, direction, content },
       });
 
-      const isRepeatAfterReply =
-        msg.direction === 'INBOUND' &&
-        existing !== null &&
-        upserted.lastAutoReplyAt !== null &&
-        existing.createdAt < upserted.lastAutoReplyAt;
-
-      if (!existing || isRepeatAfterReply) {
+      const toInsert = Math.max(0, domCount - dbCount);
+      for (let i = 0; i < toInsert; i++) {
         await prisma.linkedInMessage.create({
           data: {
             conversationId: upserted.id,
-            direction: msg.direction,
-            content: msg.content,
-            sentAt: msg.sentAt,
+            direction,
+            content,
+            sentAt: example.sentAt,
             isAutoReply: false,
           },
         });
