@@ -6,7 +6,7 @@
  * On startup:
  * - Mounts all routes
  * - Starts BullMQ workers (non-fatal if Redis is down)
- * - Starts persistent message watchers (event-driven inbox sync)
+ * - Starts schedulers (inbox sync ~60s, post scheduler 60s)
  */
 
 import 'dotenv/config';
@@ -16,7 +16,7 @@ import router from './routes/index';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { startPublishWorker } from './jobs/workers/publishWorker';
 import { startInboxSyncWorker } from './jobs/workers/inboxSyncWorker';
-import { startAllMessageWatchers } from './services/messageWatcher';
+import { startInboxScheduler } from './jobs/scheduler';
 
 
 const app = express();
@@ -102,13 +102,8 @@ app.listen(PORT, () => {
     console.warn('[Server] Server will continue without queue workers. Restart when Redis is available.');
   }
 
-  // Start persistent message watchers — event-driven inbox sync.
-  // Each watcher keeps a browser open on linkedin.com/messaging and intercepts
-  // LinkedIn's realtime WebSocket. Any frame = potential new message → sync enqueued.
-  // Zero polling — fires only when LinkedIn pushes data.
-  startAllMessageWatchers().catch((err) => {
-    console.error('[Server] Message watchers failed to start:', err instanceof Error ? err.message : String(err));
-  });
+  // Start inbox scheduler — polls every ~60s ±15s for auto-reply accounts
+  startInboxScheduler();
 
   console.log(`\n[Server] Ready — http://localhost:${PORT}\n`);
 });
