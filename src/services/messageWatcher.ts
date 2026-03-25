@@ -20,7 +20,7 @@ import prisma from '../lib/prisma';
 import { claimSession, releaseSession, BrowserSession } from './browserPool';
 import { inboxSyncQueue } from '../jobs/queues';
 
-const DEBOUNCE_MS = 3000; // wait 3s after last event before enqueueing
+const DEBOUNCE_MS = 15000; // wait 15s after last event before enqueueing
 
 // Active watcher sessions keyed by accountId
 const activeSessions = new Map<string, BrowserSession>();
@@ -36,10 +36,18 @@ function scheduleSync(accountId: string): void {
     debounceTimers.delete(accountId);
     console.log(`[MessageWatcher] Activity detected — enqueueing inbox sync for ${accountId}`);
     try {
+      // jobId deduplication: if a sync is already waiting/active for this account,
+      // BullMQ will skip the add. removeOnComplete ensures the slot clears after
+      // the job finishes so the next real event can enqueue again.
       await inboxSyncQueue.add(
-        `inbox-ws-${accountId}-${Date.now()}`,
+        'inbox-sync',
         { accountId, triggerAutoReply: true },
-        { attempts: 2 }
+        {
+          attempts: 2,
+          jobId: `inbox-sync-${accountId}`,
+          removeOnComplete: true,
+          removeOnFail: false,
+        }
       );
     } catch (err) {
       console.error(
@@ -117,20 +125,10 @@ export async function startMessageWatcher(accountId: string): Promise<void> {
     });
   });
 
-  // ── HTTP response interception (SSE / long-poll fallback) ─────────────────
-  // LinkedIn may use SSE or XHR long-polling in addition to WebSockets.
-  // Intercept any response to the messaging or realtime API endpoints.
-  page.on('response', (response) => {
-    const url = response.url();
-    if (
-      url.includes('/voyager/api/messaging/') ||
-      url.includes('/realtime/connect') ||
-      url.includes('/realtime/') ||
-      (url.includes('linkedin.com') && url.includes('messaging'))
-    ) {
-      scheduleSync(accountId);
-    }
-  });
+  // HTTP response interception intentionally removed — too noisy.
+  // LinkedIn's messaging page fires dozens of /voyager/api/messaging/ requests
+  // per minute for presence, read receipts, typing, etc. The realtime WebSocket
+  // above is sufficient to detect actual new messages.
 
   // ── Session health monitor ────────────────────────────────────────────────
   page.on('framenavigated', async (frame) => {
