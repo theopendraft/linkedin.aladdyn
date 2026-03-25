@@ -1,0 +1,458 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["linkedin"]
+}
+
+// ── LinkedIn Accounts ─────────────────────────────────────────────────────────
+
+model LinkedInAccount {
+  id       String @id @default(uuid())
+  userId   String // FK → users.id in server.aladdyn
+  funnelId String // FK → funnels.id in server.aladdyn
+
+  // OAuth tokens (Marketing API) — AES-256-GCM encrypted
+  accessToken  String?   @db.Text
+  refreshToken String?   @db.Text
+  tokenExpiry  DateTime?
+
+  // LinkedIn profile identity
+  linkedinId  String?  @unique
+  displayName String?
+  headline    String?
+  profileUrl  String?
+  orgId       String? // company page URN for posting (e.g. "urn:li:organization:12345")
+
+  // Browser session (for DM inbox access) — AES-256-GCM encrypted
+  sessionCookies String?  @db.Text
+  sessionValid   Boolean  @default(false)
+  lastSessionAt  DateTime?
+
+  // Personal profile posting (V4)
+  personalPostingEnabled Boolean @default(false)
+
+  // Auto-reply config
+  autoReplyEnabled  Boolean  @default(false)
+  replySystemPrompt String?  @db.Text // custom context for GPT-4o-mini
+  dailyActionLimit  Int      @default(25)
+  dailyActionCount  Int      @default(0)
+  dailyActionReset  DateTime?
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  posts         LinkedInPost[]
+  conversations LinkedInConversation[]
+  campaigns     LinkedInCampaign[]
+  sequences     LinkedInSequence[]
+
+  @@index([userId])
+  @@index([funnelId])
+  @@map("linkedin_accounts")
+  @@schema("linkedin")
+}
+
+// ── LinkedIn Posts ────────────────────────────────────────────────────────────
+
+model LinkedInPost {
+  id        String @id @default(uuid())
+  accountId String
+
+  text      String   @db.Text
+  mediaUrls String[]
+  postType  String   @default("TEXT") // TEXT | IMAGE | VIDEO
+  visibility String  @default("PUBLIC")
+
+  scheduledAt DateTime?
+
+  // Campaign grouping (V2)
+  campaignId String?
+
+  // Personal profile posting (V4) — if true, posts as person not org
+  postAsPersonal Boolean @default(false)
+
+  status          LinkedInPostStatus @default(DRAFT)
+  linkedinPostId  String?
+  publishedAt     DateTime?
+  publishError    String?            @db.Text
+  publishAttempts Int                @default(0)
+
+  // Analytics (fetched by background job)
+  impressions    Int?
+  clicks         Int?
+  reactions      Int?
+  comments       Int?
+  shares         Int?
+  engagementRate Float?
+  analyticsAt    DateTime?
+
+  // AI scoring
+  hookScore        Int?    // 0-100
+  readabilityScore Int?    // 0-100
+  ctaScore         Int?    // 0-100
+  aiSuggestions    String? @db.Text
+
+  // A/B test variant label (V4)
+  abVariantLabel String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account     LinkedInAccount     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  campaign    LinkedInCampaign?   @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  engagements LinkedInEngagement[]
+  abVariants  LinkedInABVariant[]
+
+  @@index([accountId, scheduledAt])
+  @@index([status, scheduledAt])
+  @@index([campaignId])
+  @@map("linkedin_posts")
+  @@schema("linkedin")
+}
+
+enum LinkedInPostStatus {
+  DRAFT
+  APPROVED
+  SCHEDULED
+  PUBLISHING
+  POSTED
+  FAILED
+  DELETED
+
+  @@schema("linkedin")
+}
+
+// ── LinkedIn DM Conversations ─────────────────────────────────────────────────
+
+model LinkedInConversation {
+  id        String @id @default(uuid())
+  accountId String
+
+  // LinkedIn's URN for this conversation thread (needed for API replies)
+  linkedinConversationId String?
+
+  // The contact we're talking to
+  participantLinkedInId String
+  participantName       String?
+  participantHeadline   String?
+  participantProfileUrl String?
+
+  // Genie conversation ID (server.aladdyn Conversation.id) — for contextual replies
+  genieConversationId String?
+
+  // Thread state
+  lastMessageAt      DateTime?
+  lastMessageSnippet String?   @db.Text
+  unreadCount        Int       @default(0)
+  autoReplyEnabled   Boolean   @default(true)
+  lastAutoReplyAt    DateTime?
+  autoReplyCount     Int       @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account  LinkedInAccount   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  messages LinkedInMessage[]
+
+  @@unique([accountId, participantLinkedInId])
+  @@index([accountId, lastMessageAt])
+  @@map("linkedin_conversations")
+  @@schema("linkedin")
+}
+
+model LinkedInMessage {
+  id             String @id @default(uuid())
+  conversationId String
+
+  direction   MessageDirection
+  content     String           @db.Text
+  sentAt      DateTime
+  isAutoReply Boolean          @default(false)
+  deliveredAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  conversation LinkedInConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, sentAt])
+  @@map("linkedin_messages")
+  @@schema("linkedin")
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+
+  @@schema("linkedin")
+}
+
+// ── LinkedIn Profiles (V2 — enriched engagement data) ─────────────────────────
+
+model LinkedInProfile {
+  id         String  @id @default(uuid())
+  linkedinId String  @unique
+
+  displayName String?
+  headline    String?
+  company     String?
+  jobTitle    String?
+  industry    String?
+  location    String?
+  profileUrl  String?
+  avatarUrl   String?
+
+  // Engagement summary (aggregated)
+  totalInteractions Int @default(0)
+  lastInteractionAt DateTime?
+
+  // Enrichment metadata
+  lastScrapedAt DateTime?
+  scrapeSource  String? // "playwright" | "api"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  engagements LinkedInEngagement[]
+  sequenceEnrollments LinkedInSequenceEnrollment[]
+
+  @@map("linkedin_profiles")
+  @@schema("linkedin")
+}
+
+// ── Engagement Tracking (V2 — who liked/commented) ────────────────────────────
+
+model LinkedInEngagement {
+  id        String @id @default(uuid())
+  postId    String
+  profileId String
+
+  type    EngagementType
+  content String? @db.Text // comment text if type=COMMENT
+
+  engagedAt DateTime @default(now())
+
+  post    LinkedInPost    @relation(fields: [postId], references: [id], onDelete: Cascade)
+  profile LinkedInProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, profileId, type])
+  @@index([postId])
+  @@index([profileId])
+  @@map("linkedin_engagements")
+  @@schema("linkedin")
+}
+
+enum EngagementType {
+  LIKE
+  COMMENT
+  SHARE
+
+  @@schema("linkedin")
+}
+
+// ── Campaigns (V2 — group posts under campaigns) ─────────────────────────────
+
+model LinkedInCampaign {
+  id        String @id @default(uuid())
+  accountId String
+
+  name        String
+  description String? @db.Text
+  status      CampaignStatus @default(ACTIVE)
+
+  // Aggregated analytics (updated by background job)
+  totalImpressions  Int   @default(0)
+  totalClicks       Int   @default(0)
+  totalReactions    Int   @default(0)
+  totalComments     Int   @default(0)
+  totalShares       Int   @default(0)
+  avgEngagementRate Float @default(0)
+
+  // AI insight summary
+  insightSummary     String?   @db.Text
+  insightGeneratedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account LinkedInAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  posts   LinkedInPost[]
+  abTests LinkedInABTest[]
+
+  @@index([accountId])
+  @@map("linkedin_campaigns")
+  @@schema("linkedin")
+}
+
+enum CampaignStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+
+  @@schema("linkedin")
+}
+
+// ── Outreach Sequences (V3) ──────────────────────────────────────────────────
+
+model LinkedInSequence {
+  id        String @id @default(uuid())
+  accountId String
+
+  name        String
+  description String? @db.Text
+  status      SequenceStatus @default(DRAFT)
+
+  // Trigger config
+  triggerType           String   @default("MANUAL") // MANUAL | POST_ENGAGEMENT
+  triggerPostId         String?  // if POST_ENGAGEMENT trigger
+  triggerEngagementTypes String[] // ["LIKE", "COMMENT"]
+
+  // Filters for segmented outreach
+  filterJobTitle  String?
+  filterCompany   String?
+  filterIndustry  String?
+  filterLocation  String?
+
+  // Rate limits (per hard constraints)
+  maxDailyMessages Int @default(20)
+  messagesSentToday Int @default(0)
+  messageLimitReset DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account     LinkedInAccount            @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  steps       LinkedInSequenceStep[]
+  enrollments LinkedInSequenceEnrollment[]
+
+  @@index([accountId])
+  @@map("linkedin_sequences")
+  @@schema("linkedin")
+}
+
+enum SequenceStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+
+  @@schema("linkedin")
+}
+
+model LinkedInSequenceStep {
+  id         String @id @default(uuid())
+  sequenceId String
+
+  order      Int
+  template   String @db.Text // message template with {{name}}, {{company}}, {{post_title}} tokens
+  delayHours Int    @default(24) // delay after previous step
+
+  createdAt DateTime @default(now())
+
+  sequence    LinkedInSequence             @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  enrollments LinkedInSequenceEnrollment[]
+
+  @@index([sequenceId])
+  @@map("linkedin_sequence_steps")
+  @@schema("linkedin")
+}
+
+model LinkedInSequenceEnrollment {
+  id         String @id @default(uuid())
+  sequenceId String
+  profileId  String
+
+  status        EnrollmentStatus @default(ACTIVE)
+  currentStepId String?
+
+  // Personalization context
+  triggerPostTitle String?
+
+  // Tracking
+  lastMessageAt DateTime?
+  nextStepAt    DateTime?
+  completedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sequence    LinkedInSequence      @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  profile     LinkedInProfile       @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  currentStep LinkedInSequenceStep? @relation(fields: [currentStepId], references: [id])
+
+  @@unique([sequenceId, profileId])
+  @@index([nextStepAt])
+  @@map("linkedin_sequence_enrollments")
+  @@schema("linkedin")
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  REPLIED
+  UNSUBSCRIBED
+
+  @@schema("linkedin")
+}
+
+// ── A/B Testing (V4) ─────────────────────────────────────────────────────────
+
+model LinkedInABTest {
+  id         String @id @default(uuid())
+  campaignId String
+
+  name   String
+  status ABTestStatus @default(RUNNING)
+
+  // Winner selection
+  metricToOptimize String  @default("engagementRate")
+  winnerVariantId  String?
+  decidedAt        DateTime?
+
+  // Auto-learning: minimum sample before declaring winner
+  minImpressions Int @default(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign LinkedInCampaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  variants LinkedInABVariant[]
+
+  @@index([campaignId])
+  @@map("linkedin_ab_tests")
+  @@schema("linkedin")
+}
+
+enum ABTestStatus {
+  RUNNING
+  DECIDED
+  CANCELLED
+
+  @@schema("linkedin")
+}
+
+model LinkedInABVariant {
+  id     String @id @default(uuid())
+  testId String
+
+  name   String // "A", "B", "C"
+  postId String?
+
+  // Variant-specific content
+  text String @db.Text
+
+  createdAt DateTime @default(now())
+
+  test LinkedInABTest @relation(fields: [testId], references: [id], onDelete: Cascade)
+  post LinkedInPost?  @relation(fields: [postId], references: [id])
+
+  @@index([testId])
+  @@map("linkedin_ab_variants")
+  @@schema("linkedin")
+}
