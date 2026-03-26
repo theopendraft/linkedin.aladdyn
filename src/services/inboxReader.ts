@@ -250,12 +250,15 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
                   // --other BEM modifier on the listitem. Messages sent by the
                   // logged-in account owner have no such modifier.
                   //
-                  // Primary: BEM modifier on the listitem itself
+                  // Primary: BEM modifier on the listitem itself.
+                  // LinkedIn marks messages from the OTHER person (received messages)
+                  // with --other. Own sent messages have no such modifier.
                   const isOtherPrimary =
                     node.classList.contains('msg-s-event-listitem--other');
 
-                  // Fallback A: check the parent message-group element
-                  // (LinkedIn sometimes puts the direction on the group wrapper)
+                  // Fallback A: check the parent message-group element.
+                  // Some LinkedIn UI versions put the direction indicator on the
+                  // group wrapper instead of the individual listitem.
                   const groupEl = node.closest(
                     '.msg-s-message-group, [class*="message-group"]'
                   );
@@ -264,13 +267,12 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
                       groupEl.getAttribute('data-urn')?.includes('other') === true
                     : false;
 
-                  // Fallback B: presence of the "other" avatar — own messages
-                  // don't show a participant avatar in the thread
-                  const isOtherFallbackB = !!node.querySelector(
-                    '.msg-s-event-listitem__profile-container, .presence-entity__image, .msg-s-event-listitem__member-image-container'
-                  );
+                  // NOTE: Do NOT use avatar/profile-image presence as a fallback.
+                  // LinkedIn's new UI renders the account owner's avatar on their
+                  // own outbound messages too — causing own sent messages to be
+                  // misclassified as INBOUND (bot then replies to itself).
 
-                  const isOther = isOtherPrimary || isOtherGroupA || isOtherFallbackB;
+                  const isOther = isOtherPrimary || isOtherGroupA;
 
                   // Message text — try selectors in order of specificity.
                   // LinkedIn's class names are stable but occasionally renamed.
@@ -295,7 +297,6 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
                     timeText,
                     _debug_isOtherPrimary: isOtherPrimary,
                     _debug_isOtherGroup: isOtherGroupA,
-                    _debug_isOtherAvatar: isOtherFallbackB,
                   };
                 })
                 .filter((m) => m.content.length > 0);
@@ -459,7 +460,7 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
     const lastDbMsg = await prisma.linkedInMessage.findFirst({
       where: { conversationId: upserted.id },
       orderBy: { createdAt: 'desc' },
-      select: { direction: true, content: true },
+      select: { direction: true, content: true, createdAt: true },
     });
 
     let newMessages: MessageData[] = [];
@@ -483,19 +484,54 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
       // Find the anchorDbCount-th occurrence from the END of the DOM.
       // Searching from the end means we hit the MOST RECENT occurrences first;
       // once we've skipped anchorDbCount matches we've landed on the anchor.
+      //
+      // Content matching uses a prefix check (first 60 chars) in addition to
+      // exact equality. LinkedIn truncates long messages in the DOM with
+      // "…See more" — textContent returns the truncated string, which won't
+      // exactly match the full text stored in DB. Prefix matching covers this.
+      //
+      // If we find fewer occurrences than anchorDbCount (DB has extra identical
+      // messages from past bugs, or old messages scrolled out of the 20-msg DOM
+      // window), we fall back to using the MOST RECENT occurrence as the anchor.
+      // That's still correct: everything in DOM after the most recent matching
+      // OUTBOUND is genuinely new from the participant.
+
+      function anchorMatches(domContent: string, dbContent: string): boolean {
+        if (domContent === dbContent) return true;
+        // Prefix match to handle DOM truncation ("long message…See more"):
+        // the DOM shows the first N chars of the full DB content.
+        const prefix = Math.min(dbContent.length, domContent.length, 60);
+        return prefix >= 40 && domContent.slice(0, prefix) === dbContent.slice(0, prefix);
+      }
+
       let anchorDomIndex = -1;
+      let firstFoundIndex = -1; // most recent DOM occurrence (fallback anchor)
       let found = 0;
+
       for (let j = domMessages.length - 1; j >= 0; j--) {
         if (
           domMessages[j].direction === lastDbMsg.direction &&
-          domMessages[j].content === lastDbMsg.content
+          anchorMatches(domMessages[j].content, lastDbMsg.content)
         ) {
           found++;
+          if (firstFoundIndex < 0) firstFoundIndex = j; // record most recent match
           if (found === anchorDbCount) {
             anchorDomIndex = j;
             break;
           }
         }
+      }
+
+      // Fallback: DB has more identical messages than DOM shows (old messages
+      // scrolled out of the 20-msg window, or duplicate DB entries from past
+      // bugs). Use the most recent DOM occurrence as the effective anchor —
+      // everything after it is still genuinely new from the participant.
+      if (anchorDomIndex < 0 && firstFoundIndex >= 0) {
+        anchorDomIndex = firstFoundIndex;
+        console.log(
+          `[InboxReader] Anchor partial match (${found}/${anchorDbCount} occurrences in DOM) ` +
+          `— using most recent at DOM[${anchorDomIndex}]`
+        );
       }
 
       if (anchorDomIndex >= 0) {
@@ -506,11 +542,79 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
           `(${lastDbMsg.direction} "${lastDbMsg.content.slice(0, 40)}") ` +
           `→ ${newMessages.length} new message(s) after it`
         );
+      } else if (lastDbMsg.direction === 'OUTBOUND') {
+        // Our last OUTBOUND is not in the DOM window. Two possible reasons:
+        //
+        // A) DELIVERY LAG — message was just sent (< 120s ago), LinkedIn hasn't
+        //    rendered it in the thread DOM yet. Running windowed dedup here would
+        //    re-insert old INBOUND messages like "Hii" with createdAt=now() →
+        //    messages[0] flips to INBOUND → bot replies again. Safe: skip.
+        //
+        // B) SCROLLED OUT — OUTBOUND is old, but the conversation grew past the
+        //    ~20-message DOM window. New INBOUND messages from the participant
+        //    are visible in the DOM but we'd miss them entirely. Fix: windowed dedup
+        //    (same as INBOUND branch), bounded to the DOM window size.
+        const sentMsAgo = Date.now() - new Date(lastDbMsg.createdAt).getTime();
+        const DELIVERY_LAG_THRESHOLD_MS = 120_000; // 2 minutes
+
+        if (sentMsAgo < DELIVERY_LAG_THRESHOLD_MS) {
+          // Case A: recent send, likely delivery lag — skip safely
+          console.log(
+            `[InboxReader] OUTBOUND anchor sent ${Math.round(sentMsAgo / 1000)}s ago ` +
+            `— delivery lag, skipping insertion this cycle`
+          );
+          // newMessages stays [] — nothing inserted
+        } else {
+          // Case B: old OUTBOUND scrolled out of the DOM window — use windowed dedup
+          // so we still catch new INBOUND messages from the participant.
+          console.log(
+            `[InboxReader] OUTBOUND anchor is ${Math.round(sentMsAgo / 1000)}s old and ` +
+            `not in DOM window — using windowed dedup`
+          );
+          const windowSize = domMessages.length;
+          const recentDbWindow = await prisma.linkedInMessage.findMany({
+            where: { conversationId: upserted.id },
+            orderBy: { createdAt: 'desc' },
+            take: windowSize,
+            select: { direction: true, content: true },
+          });
+
+          const dbWindowCounts = new Map<string, number>();
+          for (const m of recentDbWindow) {
+            const key = `${m.direction}\0${m.content}`;
+            dbWindowCounts.set(key, (dbWindowCounts.get(key) ?? 0) + 1);
+          }
+
+          const domCounts = new Map<string, { count: number; example: MessageData }>();
+          for (const m of domMessages) {
+            const key = `${m.direction}\0${m.content}`;
+            const existing = domCounts.get(key);
+            domCounts.set(key, {
+              count: (existing?.count ?? 0) + 1,
+              example: existing?.example ?? m,
+            });
+          }
+
+          for (const [key, { count: domCount, example }] of domCounts) {
+            const sep = key.indexOf('\0');
+            const direction = key.slice(0, sep) as 'INBOUND' | 'OUTBOUND';
+            const content = key.slice(sep + 1);
+            const dbCount = dbWindowCounts.get(key) ?? 0;
+            const toInsert = Math.max(0, domCount - dbCount);
+            for (let i = 0; i < toInsert; i++) {
+              newMessages.push({ direction, content, sentAt: example.sentAt });
+            }
+          }
+          console.log(
+            `[InboxReader] Windowed dedup (OUTBOUND scrolled out, window=${windowSize}) ` +
+            `→ ${newMessages.length} new message(s)`
+          );
+        }
       } else {
-        // Anchor not in DOM window (conversation is longer than what LinkedIn
-        // renders). Fall back to windowed count-based dedup: query only the
-        // same number of recent DB messages as DOM shows, so the comparison
-        // window is bounded and doesn't accumulate historical over-counts.
+        // Anchor is INBOUND and not in DOM — the conversation has more messages
+        // than LinkedIn renders in the DOM window (very long conversation, or the
+        // last INBOUND was far back). Use windowed dedup against the same number
+        // of recent DB messages as DOM shows to detect any new messages at the end.
         const windowSize = domMessages.length;
         const recentDbWindow = await prisma.linkedInMessage.findMany({
           where: { conversationId: upserted.id },
@@ -546,7 +650,7 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
           }
         }
         console.log(
-          `[InboxReader] Anchor not in DOM window (${windowSize} msgs shown) ` +
+          `[InboxReader] INBOUND anchor not in DOM window (${windowSize} msgs shown) ` +
           `→ windowed dedup found ${newMessages.length} new message(s)`
         );
       }
