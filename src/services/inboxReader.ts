@@ -59,7 +59,7 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
 
   if (!account || !account.sessionCookies || !account.sessionValid) {
     console.warn(`[InboxReader] No valid session for account ${accountId}`);
-    return { conversations: [], newMessages: 0 };
+    return { conversations: [], newMessages: 0, pendingReplies: 0 };
   }
 
   let totalNewMessages = 0;
@@ -174,10 +174,16 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
           // Direct navigation forces LinkedIn to fetch the latest thread data from API.
           if (threadId) {
             try {
+              // Use 'load' (not 'domcontentloaded') — LinkedIn's SPA loads messages
+              // via XHR calls that fire AFTER the initial HTML parse. 'domcontentloaded'
+              // returns before any message content is in the DOM.
               await page.goto(
                 `https://www.linkedin.com/messaging/thread/${threadId}/`,
-                { waitUntil: 'domcontentloaded', timeout: 20000 }
+                { waitUntil: 'load', timeout: 25000 }
               );
+              // Wait for XHR-loaded message data to settle. LinkedIn makes API calls
+              // after page load to fetch the message list; networkidle catches these.
+              await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
             } catch {
               console.warn(`[InboxReader] Failed to navigate to thread ${threadId}, skipping`);
               continue;
@@ -188,6 +194,8 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
             if (item) {
               try {
                 await item.click();
+                // After click, wait for networkidle so XHR messages load
+                await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
               } catch {
                 console.warn(`[InboxReader] Could not click into conversation ${i}`);
                 continue;
@@ -195,8 +203,21 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
             }
           }
 
-          // Wait for at least one message to appear, then let the rest load
-          await page.waitForSelector('.msg-s-event-listitem', { timeout: 10000 }).catch(() => {});
+          // Wait for at least one message element — if none appear after the
+          // extended wait above, skip this thread rather than scraping empty DOM.
+          const messagesLoaded = await page
+            .waitForSelector('.msg-s-event-listitem', { timeout: 10000 })
+            .then(() => true)
+            .catch(() => false);
+
+          if (!messagesLoaded) {
+            console.warn(
+              `[InboxReader] No message elements found in thread ` +
+              `${threadId || i} after full wait — skipping`
+            );
+            continue;
+          }
+
           await randomDelay(1200, 2500);
 
           // Read participant info from thread header
@@ -224,16 +245,42 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
             (nodes) => {
               return nodes
                 .map((node) => {
-                  // Direction: "other" class = INBOUND, otherwise OUTBOUND
-                  const isOther =
+                  // Direction detection:
+                  // LinkedIn marks messages from the OTHER person with the
+                  // --other BEM modifier on the listitem. Messages sent by the
+                  // logged-in account owner have no such modifier.
+                  //
+                  // Primary: BEM modifier on the listitem itself
+                  const isOtherPrimary =
                     node.classList.contains('msg-s-event-listitem--other');
 
-                  // Message text — try multiple selectors
+                  // Fallback A: check the parent message-group element
+                  // (LinkedIn sometimes puts the direction on the group wrapper)
+                  const groupEl = node.closest(
+                    '.msg-s-message-group, [class*="message-group"]'
+                  );
+                  const isOtherGroupA = groupEl
+                    ? groupEl.classList.contains('msg-s-message-group--inbound') ||
+                      groupEl.getAttribute('data-urn')?.includes('other') === true
+                    : false;
+
+                  // Fallback B: presence of the "other" avatar — own messages
+                  // don't show a participant avatar in the thread
+                  const isOtherFallbackB = !!node.querySelector(
+                    '.msg-s-event-listitem__profile-container, .presence-entity__image, .msg-s-event-listitem__member-image-container'
+                  );
+
+                  const isOther = isOtherPrimary || isOtherGroupA || isOtherFallbackB;
+
+                  // Message text — try selectors in order of specificity.
+                  // LinkedIn's class names are stable but occasionally renamed.
                   const bodyEl =
                     node.querySelector('.msg-s-event-listitem__body') ??
-                    node.querySelector(
-                      '.msg-s-event-listitem__message-bubble'
-                    );
+                    node.querySelector('.msg-s-event-listitem__message-bubble') ??
+                    node.querySelector('.msg-s-event-listitem__message') ??
+                    node.querySelector('[class*="event-listitem__body"]') ??
+                    node.querySelector('[class*="message-bubble"]');
+
                   const content = bodyEl?.textContent?.trim() ?? '';
 
                   // Timestamp — look in the message group header
@@ -246,10 +293,21 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
                     direction: isOther ? 'INBOUND' : 'OUTBOUND',
                     content,
                     timeText,
+                    _debug_isOtherPrimary: isOtherPrimary,
+                    _debug_isOtherGroup: isOtherGroupA,
+                    _debug_isOtherAvatar: isOtherFallbackB,
                   };
                 })
                 .filter((m) => m.content.length > 0);
             }
+          );
+
+          // Log direction breakdown to help diagnose mis-classification
+          const inboundCount = messages.filter((m) => m.direction === 'INBOUND').length;
+          const outboundCount = messages.filter((m) => m.direction === 'OUTBOUND').length;
+          console.log(
+            `[InboxReader] Thread ${threadId || i}: ${messages.length} messages ` +
+            `(INBOUND=${inboundCount}, OUTBOUND=${outboundCount})`
           );
 
           // Convert time strings to approximate dates
@@ -290,7 +348,7 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
       `[InboxReader] Sync failed for account ${accountId}:`,
       err instanceof Error ? err.message : String(err)
     );
-    return { conversations: [], newMessages: 0 };
+    return { conversations: [], newMessages: 0, pendingReplies: 0 };
   }
 
   // ─── Upsert conversations and messages into DB ───────────────────
@@ -377,46 +435,137 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
       },
     });
 
-    // Count-based message deduplication.
+    // ── Anchor-based new message detection ──────────────────────────────────
     //
-    // LinkedIn renders the full thread on every navigation, so a simple
-    // "does this content exist?" check would prevent detecting repeated messages
-    // (e.g. participant says "Hello" twice after getting a reply). Instead we
-    // compare the DOM occurrence count vs the DB record count for each unique
-    // content+direction pair and insert only the difference. Each genuinely new
-    // occurrence gets a fresh createdAt so messages[0]=INBOUND fires correctly.
-    const domCounts = new Map<string, number>();
-    const domExamples = new Map<string, MessageData>();
+    // WHY NOT COUNT-BASED:
+    //   LinkedIn's DOM only shows the last ~20 messages. If a participant sends
+    //   "Hello" and the DB already has 2+ older "Hello"s from history, DOM count
+    //   (1-2 visible) ≤ DB count (3+) → toInsert = 0 → new message silently missed.
+    //   This caused Pankaj's new messages to never reach the DB.
+    //
+    // HOW THIS WORKS:
+    //   1. Find the last message we have in DB (the "anchor").
+    //   2. Locate the anchor in the DOM array by searching from the end.
+    //      Use the N-th occurrence from end (N = DB count of that content+direction)
+    //      to skip over any DOM messages with identical content that came before it.
+    //   3. Everything in DOM AFTER the anchor position is new → insert with
+    //      createdAt = now() so messages[0] ordering flips to INBOUND correctly.
+    //   4. Fallback (anchor not in DOM window — conversation longer than 20 msgs):
+    //      windowed count-based dedup against only the most recent DOM-window-size
+    //      DB messages, which bounds the over-counting problem to that window.
 
-    for (const msg of conv.messages) {
-      const key = `${msg.direction}\0${msg.content}`;
-      domCounts.set(key, (domCounts.get(key) ?? 0) + 1);
-      if (!domExamples.has(key)) domExamples.set(key, msg);
-    }
+    const domMessages = conv.messages; // oldest → newest (DOM render order)
 
-    for (const [key, domCount] of domCounts) {
-      const sep = key.indexOf('\0');
-      const direction = key.slice(0, sep) as 'INBOUND' | 'OUTBOUND';
-      const content = key.slice(sep + 1);
-      const example = domExamples.get(key)!;
+    const lastDbMsg = await prisma.linkedInMessage.findFirst({
+      where: { conversationId: upserted.id },
+      orderBy: { createdAt: 'desc' },
+      select: { direction: true, content: true },
+    });
 
-      const dbCount = await prisma.linkedInMessage.count({
-        where: { conversationId: upserted.id, direction, content },
+    let newMessages: MessageData[] = [];
+
+    if (!lastDbMsg) {
+      // Brand-new conversation — every DOM message is new
+      newMessages = domMessages;
+      console.log(
+        `[InboxReader] New conversation ${upserted.id} — inserting all ${newMessages.length} messages`
+      );
+    } else {
+      // Count how many times the anchor content+direction appears in DB
+      const anchorDbCount = await prisma.linkedInMessage.count({
+        where: {
+          conversationId: upserted.id,
+          direction: lastDbMsg.direction,
+          content: lastDbMsg.content,
+        },
       });
 
-      const toInsert = Math.max(0, domCount - dbCount);
-      for (let i = 0; i < toInsert; i++) {
-        await prisma.linkedInMessage.create({
-          data: {
-            conversationId: upserted.id,
-            direction,
-            content,
-            sentAt: example.sentAt,
-            isAutoReply: false,
-          },
-        });
-        totalNewMessages++;
+      // Find the anchorDbCount-th occurrence from the END of the DOM.
+      // Searching from the end means we hit the MOST RECENT occurrences first;
+      // once we've skipped anchorDbCount matches we've landed on the anchor.
+      let anchorDomIndex = -1;
+      let found = 0;
+      for (let j = domMessages.length - 1; j >= 0; j--) {
+        if (
+          domMessages[j].direction === lastDbMsg.direction &&
+          domMessages[j].content === lastDbMsg.content
+        ) {
+          found++;
+          if (found === anchorDbCount) {
+            anchorDomIndex = j;
+            break;
+          }
+        }
       }
+
+      if (anchorDomIndex >= 0) {
+        // Anchor found — all DOM messages after it are new
+        newMessages = domMessages.slice(anchorDomIndex + 1);
+        console.log(
+          `[InboxReader] Anchor at DOM[${anchorDomIndex}] ` +
+          `(${lastDbMsg.direction} "${lastDbMsg.content.slice(0, 40)}") ` +
+          `→ ${newMessages.length} new message(s) after it`
+        );
+      } else {
+        // Anchor not in DOM window (conversation is longer than what LinkedIn
+        // renders). Fall back to windowed count-based dedup: query only the
+        // same number of recent DB messages as DOM shows, so the comparison
+        // window is bounded and doesn't accumulate historical over-counts.
+        const windowSize = domMessages.length;
+        const recentDbWindow = await prisma.linkedInMessage.findMany({
+          where: { conversationId: upserted.id },
+          orderBy: { createdAt: 'desc' },
+          take: windowSize,
+          select: { direction: true, content: true },
+        });
+
+        const dbWindowCounts = new Map<string, number>();
+        for (const m of recentDbWindow) {
+          const key = `${m.direction}\0${m.content}`;
+          dbWindowCounts.set(key, (dbWindowCounts.get(key) ?? 0) + 1);
+        }
+
+        const domCounts = new Map<string, { count: number; example: MessageData }>();
+        for (const m of domMessages) {
+          const key = `${m.direction}\0${m.content}`;
+          const existing = domCounts.get(key);
+          domCounts.set(key, {
+            count: (existing?.count ?? 0) + 1,
+            example: existing?.example ?? m,
+          });
+        }
+
+        for (const [key, { count: domCount, example }] of domCounts) {
+          const sep = key.indexOf('\0');
+          const direction = key.slice(0, sep) as 'INBOUND' | 'OUTBOUND';
+          const content = key.slice(sep + 1);
+          const dbCount = dbWindowCounts.get(key) ?? 0;
+          const toInsert = Math.max(0, domCount - dbCount);
+          for (let i = 0; i < toInsert; i++) {
+            newMessages.push({ direction, content, sentAt: example.sentAt });
+          }
+        }
+        console.log(
+          `[InboxReader] Anchor not in DOM window (${windowSize} msgs shown) ` +
+          `→ windowed dedup found ${newMessages.length} new message(s)`
+        );
+      }
+    }
+
+    // Insert all detected new messages with createdAt = now() so that
+    // messages ordered by createdAt DESC in processAutoReplies correctly
+    // shows the newest message at [0].
+    for (const msg of newMessages) {
+      await prisma.linkedInMessage.create({
+        data: {
+          conversationId: upserted.id,
+          direction: msg.direction,
+          content: msg.content,
+          sentAt: msg.sentAt,
+          isAutoReply: false,
+        },
+      });
+      totalNewMessages++;
     }
   }
 
