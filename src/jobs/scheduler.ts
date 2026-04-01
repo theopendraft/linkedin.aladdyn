@@ -90,10 +90,17 @@ async function scheduleInboxSyncs(): Promise<void> {
   console.log(`[Scheduler] Enqueueing inbox sync for ${accounts.length} accounts`);
 
   for (const account of accounts) {
+    // Use the same jobId scheme as messageWatcher so scheduler and watcher
+    // deduplicate against each other — if one is already waiting, the add is a no-op.
     await inboxSyncQueue.add(
-      `inbox-sync-${account.id}-${Date.now()}`,
+      'inbox-sync',
       { accountId: account.id, triggerAutoReply: true },
-      { attempts: 2 }
+      {
+        jobId: `inbox-sync-${account.id}`,
+        removeOnComplete: true,
+        removeOnFail: false,
+        attempts: 2,
+      }
     );
   }
 }

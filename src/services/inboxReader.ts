@@ -357,6 +357,57 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
   for (const conv of conversations) {
     if (!conv.participantLinkedInId) continue;
 
+    // ── Thread-ID normalization ──────────────────────────────────────────────
+    // The participantLinkedInId is extracted from the DOM and can vary between
+    // syncs (profile URL extraction fails → falls back to name slug), creating
+    // duplicate conversation records. A LinkedIn thread ID (from the URL) is
+    // stable and authoritative. If we have one, use it to find any existing
+    // conversation for this thread and pin its participantLinkedInId to the
+    // current extraction before the upsert runs.
+    if (conv.linkedinConversationId) {
+      const existingByThread = await prisma.linkedInConversation.findFirst({
+        where: {
+          accountId,
+          linkedinConversationId: conv.linkedinConversationId,
+          participantLinkedInId: { not: conv.participantLinkedInId },
+        },
+      });
+
+      if (existingByThread) {
+        // Check whether a conversation already exists with the new (correct) ID
+        const alreadyExists = await prisma.linkedInConversation.findUnique({
+          where: {
+            accountId_participantLinkedInId: {
+              accountId,
+              participantLinkedInId: conv.participantLinkedInId,
+            },
+          },
+        });
+
+        if (!alreadyExists) {
+          // Safe to rename — just update the stale participantLinkedInId
+          await prisma.linkedInConversation.update({
+            where: { id: existingByThread.id },
+            data: { participantLinkedInId: conv.participantLinkedInId },
+          });
+          console.log(
+            `[InboxReader] Normalized conversation ${existingByThread.id} participantLinkedInId via threadId ` +
+            `${existingByThread.participantLinkedInId} → ${conv.participantLinkedInId}`
+          );
+        } else {
+          // Both records exist for the same thread — merge and delete the stale one
+          await prisma.linkedInMessage.updateMany({
+            where: { conversationId: existingByThread.id },
+            data: { conversationId: alreadyExists.id },
+          });
+          await prisma.linkedInConversation.delete({ where: { id: existingByThread.id } });
+          console.log(
+            `[InboxReader] Merged duplicate conversation ${existingByThread.id} into ${alreadyExists.id} (same threadId)`
+          );
+        }
+      }
+    }
+
     // Check for stale conversation with a different participantLinkedInId
     // (e.g., old URN-based ID vs new DOM-extracted public ID).
     const existingByName = await prisma.linkedInConversation.findFirst({
@@ -659,7 +710,25 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
     // Insert all detected new messages with createdAt = now() so that
     // messages ordered by createdAt DESC in processAutoReplies correctly
     // shows the newest message at [0].
+    //
+    // OUTBOUND dedup: processAutoReplies already saves every bot reply to DB
+    // before sendDM runs. If syncInbox detects the same OUTBOUND content in the
+    // DOM it means the anchor count drifted — skip to prevent anchorDbCount
+    // inflation which in turn causes stale INBOUND messages to be re-inserted
+    // as new (flipping messages[0] back to INBOUND → infinite reply loop).
     for (const msg of newMessages) {
+      if (msg.direction === 'OUTBOUND') {
+        const alreadyInDb = await prisma.linkedInMessage.count({
+          where: { conversationId: upserted.id, direction: 'OUTBOUND', content: msg.content },
+        });
+        if (alreadyInDb > 0) {
+          console.log(
+            `[InboxReader] Skipping duplicate OUTBOUND from DOM scrape: "${msg.content.slice(0, 60)}"`
+          );
+          continue;
+        }
+      }
+
       await prisma.linkedInMessage.create({
         data: {
           conversationId: upserted.id,
@@ -810,8 +879,12 @@ export async function sendDM(params: {
             .waitForSelector('.msg-s-event-listitem', { timeout: 8000 })
             .catch(() => {});
         } else {
-          console.warn(
-            `[InboxReader] Could not find conversation for "${participantName}" in sidebar`
+          // Abort — do NOT fall through. Continuing without navigating to the
+          // correct thread would send the DM to whatever conversation is currently
+          // open in the browser (typically the last-synced thread), silently
+          // spamming the wrong person.
+          throw new Error(
+            `[sendDM] Participant "${participantName}" not found in sidebar — aborting to prevent wrong-thread send`
           );
         }
       }

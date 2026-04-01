@@ -241,11 +241,21 @@ export const toggleAutoReply = asyncHandler(async (req: Request, res: Response) 
     throw new AppError('Account not found', 404);
   }
 
+  const DEFAULT_REPLY_PROMPT =
+    'Reply only to genuine business enquiries. Skip cold sales pitches, marketing messages, and connection milestone notifications. For greetings like "Hello" or "Hi", respond warmly and ask how you can help. Keep replies concise and professional.';
+
+  // When turning auto-reply on for the first time with no instructions set,
+  // seed a sensible default so genie behaves correctly out of the box.
+  const resolvedPrompt =
+    replySystemPrompt !== undefined
+      ? replySystemPrompt
+      : existing.replySystemPrompt ?? (autoReplyEnabled ? DEFAULT_REPLY_PROMPT : null);
+
   const account = await prisma.linkedInAccount.update({
     where: { id },
     data: {
       autoReplyEnabled,
-      replySystemPrompt: replySystemPrompt ?? existing.replySystemPrompt,
+      replySystemPrompt: resolvedPrompt,
     },
     select: SAFE_ACCOUNT_SELECT,
   });

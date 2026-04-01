@@ -17,6 +17,9 @@
 
 import prisma from '../lib/prisma';
 import { sendDM } from './inboxReader';
+import { createLogger } from '../utils/logger';
+
+const logger = createLogger({ service: 'auto-reply' });
 
 const MAX_HISTORY_MESSAGES = 10;
 
@@ -38,6 +41,7 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
       id: true,
       funnelId: true,
       autoReplyEnabled: true,
+      replySystemPrompt: true,
       dailyActionCount: true,
       dailyActionLimit: true,
       dailyActionReset: true,
@@ -46,27 +50,30 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
   });
 
   if (!account) {
-    console.warn(`[AutoReply] Account ${accountId} not found`);
+    logger.warn('Account not found', { accountId });
     return { processed: 0, replied: 0, skipped: 0 };
   }
 
-  console.log(
-    `[AutoReply] Account state: autoReplyEnabled=${account.autoReplyEnabled} ` +
-    `sessionValid=${account.sessionValid} dailyCount=${account.dailyActionCount}/${account.dailyActionLimit}`
-  );
+  logger.info('Account state', {
+    accountId,
+    autoReplyEnabled: String(account.autoReplyEnabled),
+    sessionValid: String(account.sessionValid),
+    dailyCount: String(account.dailyActionCount),
+    dailyLimit: String(account.dailyActionLimit),
+  });
 
   if (!account.autoReplyEnabled) {
-    console.log(`[AutoReply] Auto-reply disabled for account ${accountId}`);
+    logger.info('Auto-reply disabled', { accountId });
     return { processed: 0, replied: 0, skipped: 0 };
   }
 
   if (!account.sessionValid) {
-    console.warn(`[AutoReply] No valid session for account ${accountId}`);
+    logger.warn('No valid session', { accountId });
     return { processed: 0, replied: 0, skipped: 0 };
   }
 
   if (!account.funnelId) {
-    console.warn(`[AutoReply] No funnelId configured for account ${accountId} — genie cannot reply`);
+    logger.warn('No funnelId configured — genie cannot reply', { accountId });
     return { processed: 0, replied: 0, skipped: 0 };
   }
 
@@ -84,9 +91,7 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
   }
 
   if (account.dailyActionCount >= account.dailyActionLimit) {
-    console.log(
-      `[AutoReply] Daily limit reached for account ${accountId} (${account.dailyActionCount}/${account.dailyActionLimit})`
-    );
+    logger.info('Daily limit reached', { accountId, count: String(account.dailyActionCount), limit: String(account.dailyActionLimit) });
     return { processed: 0, replied: 0, skipped: 0 };
   }
 
@@ -114,13 +119,10 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     orderBy: { lastMessageAt: 'desc' },
   });
 
-  console.log(`[AutoReply] ${conversations.length} conversation(s) with autoReplyEnabled=true`);
+  logger.info('Conversations with autoReplyEnabled', { accountId, count: String(conversations.length) });
   for (const conv of conversations) {
     const dirs = conv.messages.map((m) => m.direction).join(',');
-    console.log(
-      `[AutoReply]   conv=${conv.id} participant=${conv.participantLinkedInId} ` +
-      `msgs=${conv.messages.length} directions=[${dirs}] unreadCount=${conv.unreadCount}`
-    );
+    logger.debug('Conversation state', { convId: conv.id, participant: conv.participantLinkedInId, msgCount: String(conv.messages.length), directions: dirs, unreadCount: String(conv.unreadCount) });
   }
 
   // Eligible = most recently stored message is INBOUND.
@@ -136,7 +138,9 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
   // This prevents a double-send if processAutoReplies is somehow called twice
   // in rapid succession before the next syncInbox has a chance to flip
   // messages[0] back to OUTBOUND via the next DOM scrape.
-  const REPLY_COOLDOWN_MS = 90_000; // 90 seconds
+  // 5 minutes — well above the ~60s scheduler interval so a queued-but-not-yet-processed
+  // job can never slip through after the previous reply was sent.
+  const REPLY_COOLDOWN_MS = 300_000; // 5 minutes
   const eligible = conversations.filter((conv) => {
     if (conv.messages.length === 0) return false;
     if (conv.messages[0].direction !== 'INBOUND') return false;
@@ -145,23 +149,17 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     if (conv.lastAutoReplyAt) {
       const msSinceReply = Date.now() - new Date(conv.lastAutoReplyAt).getTime();
       if (msSinceReply < REPLY_COOLDOWN_MS) {
-        console.log(
-          `[AutoReply]   conv=${conv.id} skipped — replied ${Math.round(msSinceReply / 1000)}s ago (cooldown ${REPLY_COOLDOWN_MS / 1000}s)`
-        );
+        logger.debug('Skipped — cooldown active', { convId: conv.id, msSinceReply: String(Math.round(msSinceReply / 1000)), cooldownSec: String(REPLY_COOLDOWN_MS / 1000) });
         return false;
       }
     }
     return true;
   });
 
-  console.log(`[AutoReply] ${eligible.length}/${conversations.length} eligible (messages[0]=INBOUND)`);
+  logger.info('Eligible conversations', { accountId, eligible: String(eligible.length), total: String(conversations.length) });
   for (const conv of eligible) {
     const newestInbound = conv.messages.find((m) => m.direction === 'INBOUND');
-    console.log(
-      `[AutoReply]   → conv=${conv.id} participant=${conv.participantLinkedInId} ` +
-      `lastAutoReplyAt=${conv.lastAutoReplyAt ?? 'never'} ` +
-      `newestInbound.createdAt=${newestInbound?.createdAt ?? 'none'}`
-    );
+    logger.debug('Eligible conversation', { convId: conv.id, participant: conv.participantLinkedInId, lastAutoReplyAt: conv.lastAutoReplyAt?.toISOString() ?? 'never', newestInboundAt: newestInbound?.createdAt?.toISOString() ?? 'none' });
   }
 
   let replied = 0;
@@ -175,7 +173,7 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     });
 
     if (!freshAccount || freshAccount.dailyActionCount >= freshAccount.dailyActionLimit) {
-      console.log(`[AutoReply] Daily limit reached mid-loop for account ${accountId}`);
+      logger.info('Daily limit reached mid-loop', { accountId });
       skipped += eligible.length - replied - skipped;
       break;
     }
@@ -195,6 +193,19 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
         continue;
       }
 
+      // Pre-reply classifier: skip system notifications and cold-outreach spam
+      // that don't warrant a business response.
+      const hasCustomPrompt = Boolean(account.replySystemPrompt?.trim());
+      if (shouldSkipMessage(lastInbound.content, hasCustomPrompt)) {
+        logger.info('[SKIP] Message classified as non-actionable', {
+          convId: conv.id,
+          participant: conv.participantLinkedInId,
+          preview: lastInbound.content.slice(0, 80),
+        });
+        skipped++;
+        continue;
+      }
+
       // Route through genie Agent V2 — same path as WhatsApp / Instagram.
       // Genie manages conversation history via conversationId; we don't need
       // to pass the full message history manually.
@@ -203,6 +214,7 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
         funnelId: account.funnelId,
         senderId: conv.participantLinkedInId,
         genieConversationId: conv.genieConversationId ?? undefined,
+        extraInstructions: account.replySystemPrompt ?? undefined,
       });
 
       // ── Save OUTBOUND to DB BEFORE sending ───────────────────────────────────
@@ -260,15 +272,9 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
       }
 
       replied++;
-      console.log(
-        `[AutoReply] Replied to conversation ${conv.id} (participant=${conv.participantLinkedInId})` +
-        (returnedConvId ? ` genieConvId=${returnedConvId}` : '')
-      );
+      logger.info('Replied to conversation', { convId: conv.id, participant: conv.participantLinkedInId, ...(returnedConvId ? { genieConvId: returnedConvId } : {}) });
     } catch (err) {
-      console.error(
-        `[AutoReply] Failed to reply to conversation ${conv.id}:`,
-        err instanceof Error ? err.message : String(err)
-      );
+      logger.error('Failed to reply to conversation', { convId: conv.id, error: err instanceof Error ? err.message : String(err) });
       skipped++;
     }
   }
@@ -278,6 +284,37 @@ export async function processAutoReplies(accountId: string): Promise<AutoReplyRe
     replied,
     skipped: skipped + Math.max(0, eligible.length - replied - skipped),
   };
+}
+
+/**
+ * Returns true when the message should be silently skipped (no reply sent).
+ *
+ * Covers LinkedIn system notifications and obvious cold-outreach / spam patterns
+ * that don't warrant a business reply. When the account has a custom
+ * replySystemPrompt configured, the length check is bypassed so genie can
+ * handle short greetings per the user's own instructions.
+ */
+function shouldSkipMessage(content: string, hasCustomPrompt: boolean): boolean {
+  const text = content.trim();
+
+  // LinkedIn system / milestone notifications
+  if (/accepted your invitation|connected with you/i.test(text)) return true;
+  if (/^congratulations/i.test(text)) return true;
+
+  // Obvious cold-outreach / promotional patterns
+  if (
+    /i came across your profile|i'd love to connect|let me know if you('re| are) interested|quick question — |quick question:|we help (companies|businesses|startups)/i.test(
+      text
+    )
+  )
+    return true;
+
+  // Very short messages (≤3 chars, e.g. "Hi", emoji-only) — skip only when
+  // the user hasn't set custom instructions. If they have, trust genie to handle
+  // greetings per those instructions.
+  if (!hasCustomPrompt && text.length <= 3) return true;
+
+  return false;
 }
 
 /**
@@ -294,8 +331,9 @@ async function generateReplyViaGenie(params: {
   funnelId: string;
   senderId: string;
   genieConversationId?: string;
+  extraInstructions?: string;
 }): Promise<{ reply: string; conversationId?: string }> {
-  const { query, funnelId, senderId, genieConversationId } = params;
+  const { query, funnelId, senderId, genieConversationId, extraInstructions } = params;
 
   const serverApiUrl = process.env.SERVER_API_URL;
   if (!serverApiUrl) {
@@ -311,6 +349,7 @@ async function generateReplyViaGenie(params: {
       platform: 'linkedin',
       senderId,
       ...(genieConversationId ? { conversationId: genieConversationId } : {}),
+      ...(extraInstructions ? { extraInstructions } : {}),
     }),
   });
 

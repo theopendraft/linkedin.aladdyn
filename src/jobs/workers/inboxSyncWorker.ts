@@ -14,22 +14,23 @@ import { redisConnection } from '../redis';
 import { QUEUE_NAMES, InboxSyncJobData } from '../queues';
 import { syncInbox } from '../../services/inboxReader';
 import { processAutoReplies } from '../../services/autoReply';
+import { createLogger } from '../../utils/logger';
+
+const logger = createLogger({ service: 'inbox-sync-worker' });
 
 async function processInboxSync(job: Job<InboxSyncJobData>): Promise<void> {
   const { accountId, triggerAutoReply } = job.data;
 
-  console.log(
-    `[InboxSyncWorker] Processing sync for account ${accountId} (autoReply: ${triggerAutoReply})`
-  );
+  logger.info('Processing sync', { accountId, triggerAutoReply: String(triggerAutoReply) });
 
   try {
     const syncResult = await syncInbox(accountId);
-    console.log(
-      `[InboxSyncWorker] Sync complete for ${accountId}: ` +
-        `${syncResult.conversations.length} conversations, ` +
-        `${syncResult.newMessages} new to DB, ` +
-        `${syncResult.pendingReplies} pending reply`
-    );
+    logger.info('Sync complete', {
+      accountId,
+      conversations: String(syncResult.conversations.length),
+      newMessages: String(syncResult.newMessages),
+      pendingReplies: String(syncResult.pendingReplies),
+    });
 
     if (triggerAutoReply) {
       // Always run — processAutoReplies does a cheap DB eligibility check
@@ -37,14 +38,16 @@ async function processInboxSync(job: Job<InboxSyncJobData>): Promise<void> {
       // Gating on syncResult.newMessages would miss messages that were synced in a
       // previous cycle but never replied to (e.g. after a failed attempt).
       const replyResult = await processAutoReplies(accountId);
-      console.log(
-        `[InboxSyncWorker] Auto-reply complete for ${accountId}: ` +
-          `processed=${replyResult.processed} replied=${replyResult.replied} skipped=${replyResult.skipped}`
-      );
+      logger.info('Auto-reply complete', {
+        accountId,
+        processed: String(replyResult.processed),
+        replied: String(replyResult.replied),
+        skipped: String(replyResult.skipped),
+      });
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[InboxSyncWorker] Sync failed for account ${accountId}: ${message}`);
+    logger.error('Sync failed', { accountId, error: message });
     // Re-throw so BullMQ handles retries
     throw err;
   }
@@ -57,20 +60,18 @@ export function startInboxSyncWorker(): Worker<InboxSyncJobData> {
   });
 
   worker.on('completed', (job) => {
-    console.log(`[InboxSyncWorker] Job ${job.id} completed`);
+    logger.info('Job completed', { jobId: job.id ?? '' });
   });
 
   worker.on('failed', (job, err) => {
-    console.error(
-      `[InboxSyncWorker] Job ${job?.id} failed (attempt ${job?.attemptsMade}): ${err.message}`
-    );
+    logger.error('Job failed', { jobId: job?.id ?? '', attempt: String(job?.attemptsMade ?? 0), error: err.message });
   });
 
   worker.on('error', (err) => {
     // Non-fatal — worker errors must not crash the server
-    console.error('[InboxSyncWorker] Worker error:', err.message);
+    logger.error('Worker error', { error: err.message });
   });
 
-  console.log('[InboxSyncWorker] Started (concurrency: 1)');
+  logger.info('Started', { concurrency: '1' });
   return worker;
 }
