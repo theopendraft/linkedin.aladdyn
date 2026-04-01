@@ -98,7 +98,7 @@ async function scheduleInboxSyncs(): Promise<void> {
       {
         jobId: `inbox-sync-${account.id}`,
         removeOnComplete: true,
-        removeOnFail: false,
+        removeOnFail: true,  // must be true — false causes failed jobs to permanently block the jobId slot
         attempts: 2,
       }
     );

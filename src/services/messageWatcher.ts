@@ -46,7 +46,7 @@ function scheduleSync(accountId: string): void {
           attempts: 2,
           jobId: `inbox-sync-${accountId}`,
           removeOnComplete: true,
-          removeOnFail: false,
+          removeOnFail: true,  // must be true — false causes failed jobs to permanently block the jobId slot
         }
       );
     } catch (err) {

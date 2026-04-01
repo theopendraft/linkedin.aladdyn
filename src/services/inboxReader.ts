@@ -524,13 +524,21 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
       );
     } else {
       // Count how many times the anchor content+direction appears in DB
-      const anchorDbCount = await prisma.linkedInMessage.count({
-        where: {
-          conversationId: upserted.id,
-          direction: lastDbMsg.direction,
-          content: lastDbMsg.content,
-        },
+      // Count only within the last DOM-window-size messages in DB.
+      // Counting ALL occurrences in the full history inflates anchorDbCount when
+      // the bot sends identical greetings across multiple sessions (e.g. genie
+      // re-introduces itself several times). An inflated count makes the anchor
+      // search fall back to the wrong position, causing old INBOUNDs to be
+      // re-detected as new on every subsequent sync.
+      const recentForAnchor = await prisma.linkedInMessage.findMany({
+        where: { conversationId: upserted.id },
+        orderBy: { createdAt: 'desc' },
+        take: domMessages.length,
+        select: { direction: true, content: true },
       });
+      const anchorDbCount = recentForAnchor.filter(
+        (m) => m.direction === lastDbMsg.direction && m.content === lastDbMsg.content
+      ).length || 1; // minimum 1 so the anchor search always runs
 
       // Find the anchorDbCount-th occurrence from the END of the DOM.
       // Searching from the end means we hit the MOST RECENT occurrences first;
@@ -718,12 +726,41 @@ export async function syncInbox(accountId: string): Promise<SyncResult> {
     // as new (flipping messages[0] back to INBOUND → infinite reply loop).
     for (const msg of newMessages) {
       if (msg.direction === 'OUTBOUND') {
+        // OUTBOUND dedup: all bot replies are saved by processAutoReplies before
+        // sendDM runs. Re-inserting them inflates anchorDbCount and breaks the
+        // anchor search on the next sync.
         const alreadyInDb = await prisma.linkedInMessage.count({
           where: { conversationId: upserted.id, direction: 'OUTBOUND', content: msg.content },
         });
         if (alreadyInDb > 0) {
           console.log(
             `[InboxReader] Skipping duplicate OUTBOUND from DOM scrape: "${msg.content.slice(0, 60)}"`
+          );
+          continue;
+        }
+      }
+
+      if (msg.direction === 'INBOUND') {
+        // INBOUND dedup: old messages from a long conversation history can appear
+        // in the DOM window even after the anchor, and get re-inserted with
+        // createdAt=now() — making them messages[0] and triggering a spurious
+        // auto-reply. Dedup by content + sentAt window (±2 min to account for
+        // LinkedIn's minute-level timestamp granularity).
+        const sentAtMs = msg.sentAt.getTime();
+        const alreadyInDb = await prisma.linkedInMessage.count({
+          where: {
+            conversationId: upserted.id,
+            direction: 'INBOUND',
+            content: msg.content,
+            sentAt: {
+              gte: new Date(sentAtMs - 2 * 60_000),
+              lte: new Date(sentAtMs + 2 * 60_000),
+            },
+          },
+        });
+        if (alreadyInDb > 0) {
+          console.log(
+            `[InboxReader] Skipping duplicate INBOUND from DOM scrape: "${msg.content.slice(0, 60)}"`
           );
           continue;
         }

@@ -57,6 +57,11 @@ export function startInboxSyncWorker(): Worker<InboxSyncJobData> {
   const worker = new Worker<InboxSyncJobData>(QUEUE_NAMES.INBOX_SYNC, processInboxSync, {
     connection: redisConnection,
     concurrency: 1, // One inbox sync at a time per worker instance
+    // Inbox sync involves Playwright browser automation across multiple conversations
+    // (navigate, wait for load, networkidle, random delays). Default lockDuration is
+    // 30s — far too short. Set to 5 minutes so BullMQ doesn't mark the job as stalled
+    // while the browser is still working.
+    lockDuration: 300_000, // 5 minutes
   });
 
   worker.on('completed', (job) => {
