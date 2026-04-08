@@ -2,6 +2,7 @@ import prisma from '../lib/prisma';
 import { decrypt } from '../lib/encrypt';
 import {
   getPostAnalytics,
+  LinkedInApiError,
   refreshAccessToken,
 } from './linkedinApi';
 import { aggregateCampaignAnalytics } from './campaignAnalytics';
@@ -26,8 +27,13 @@ export async function syncAnalyticsForAccount(
       accessToken: true,
       refreshToken: true,
       tokenExpiry: true,
+      orgId: true,
     },
   });
+
+  if (!account.accessToken) {
+    throw new Error(`No access token found for account ${accountId}`);
+  }
 
   let accessToken = decrypt(account.accessToken);
 
@@ -36,8 +42,14 @@ export async function syncAnalyticsForAccount(
     account.tokenExpiry &&
     account.tokenExpiry.getTime() < Date.now() + 5 * 60 * 1000
   ) {
+    if (!account.refreshToken) {
+      throw new Error(
+        `Access token is expiring and no refresh token is available for account ${accountId}`
+      );
+    }
+
     const refreshed = await refreshAccessToken(
-      decrypt(account.refreshToken!)
+      decrypt(account.refreshToken)
     );
     accessToken = refreshed.accessToken;
   }
@@ -58,8 +70,16 @@ export async function syncAnalyticsForAccount(
       id: true,
       linkedinPostId: true,
       campaignId: true,
+      postAsPersonal: true,
     },
   });
+
+  if (!account.orgId) {
+    console.warn(
+      `[AnalyticsSync] Skipping analytics for account ${accountId}: missing organization ID`
+    );
+    return { synced: 0, failed: 0, skipped: posts.length };
+  }
 
   let synced = 0;
   let failed = 0;
@@ -67,8 +87,8 @@ export async function syncAnalyticsForAccount(
 
   const affectedCampaignIds = new Set<string>();
 
-  for (const post of posts) {
-    if (!post.linkedinPostId) {
+  for (const [index, post] of posts.entries()) {
+    if (!post.linkedinPostId || post.postAsPersonal) {
       skipped++;
       continue;
     }
@@ -77,6 +97,7 @@ export async function syncAnalyticsForAccount(
       const analytics = await getPostAnalytics({
         accessToken,
         linkedinPostId: post.linkedinPostId,
+        organizationId: account.orgId,
       });
 
       const engagementRate =
@@ -107,6 +128,19 @@ export async function syncAnalyticsForAccount(
 
       synced++;
     } catch (error) {
+      if (
+        error instanceof LinkedInApiError &&
+        error.isPermissionError
+      ) {
+        const remaining = posts.length - index;
+        skipped += remaining;
+
+        console.warn(
+          `[AnalyticsSync] Skipping remaining analytics for account ${accountId}: insufficient LinkedIn permissions (${error.message})`
+        );
+        break;
+      }
+
       console.error(
         `[AnalyticsSync] Failed to sync post ${post.id}:`,
         error
@@ -131,7 +165,7 @@ export async function syncAnalyticsForAccount(
   }
 
   console.log(
-    `[AnalyticsSync] Synced ${synced} posts for account ${accountId}`
+    `[AnalyticsSync] Account ${accountId}: synced=${synced}, failed=${failed}, skipped=${skipped}`
   );
 
   return { synced, failed, skipped };

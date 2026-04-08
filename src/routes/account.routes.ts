@@ -10,6 +10,8 @@ import {
   disconnectAccount,
   toggleAutoReply,
   refreshToken,
+  triggerAnalyticsSync,
+  getAccountStatus,
 } from '../controllers/account.controller';
 
 const router = Router();
@@ -26,5 +28,7 @@ router.get('/:id', getAccount);
 router.delete('/:id', disconnectAccount);
 router.put('/:id/auto-reply', toggleAutoReply);
 router.post('/:id/refresh-token', refreshToken);
+router.post('/:id/analytics/sync', triggerAnalyticsSync);
+router.get('/:id/status', getAccountStatus);
 
 export default router;

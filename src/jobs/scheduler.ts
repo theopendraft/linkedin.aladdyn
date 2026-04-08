@@ -35,6 +35,35 @@ async function scheduleUpcomingPosts(): Promise<void> {
   const now = new Date();
   const lookahead = new Date(now.getTime() + LOOKAHEAD_MINUTES * 60 * 1000);
 
+  // Block posts from accounts whose token is definitively expired AND has no refresh token.
+  // The publish worker handles token refresh when a refresh token is available.
+  // These posts stay APPROVED — they'll be enqueued once the user reconnects.
+  const blockedPosts = await prisma.linkedInPost.findMany({
+    where: {
+      status: 'APPROVED',
+      scheduledAt: { lte: lookahead },
+      account: {
+        tokenExpiry: { lte: now },
+        refreshToken: null, // no refresh token means reconnection is required
+      },
+    },
+    select: { id: true },
+  });
+
+  if (blockedPosts.length > 0) {
+    console.warn(
+      `[Scheduler] Blocking ${blockedPosts.length} posts — accounts have expired tokens with no refresh token`
+    );
+    await prisma.linkedInPost.updateMany({
+      where: { id: { in: blockedPosts.map((p) => p.id) } },
+      data: {
+        status: 'FAILED',
+        publishError:
+          'LinkedIn OAuth token expired and no refresh token available. Reconnect your LinkedIn account to resume publishing.',
+      },
+    });
+  }
+
   const posts = await prisma.linkedInPost.findMany({
     where: {
       status: 'APPROVED',

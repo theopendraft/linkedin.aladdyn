@@ -16,6 +16,7 @@ import { AppError, asyncHandler } from '../middleware/errorHandler';
 import { getProfile, refreshAccessToken } from '../services/linkedinApi';
 import { launchLinkedInLogin, getLaunchStatus } from '../services/sessionLauncher';
 import { startMessageWatcher, stopMessageWatcher } from '../services/messageWatcher';
+import { syncAnalyticsForAccount } from '../services/analyticsSyncService';
 
 // Fields always excluded from account responses
 const SAFE_ACCOUNT_SELECT = {
@@ -364,3 +365,83 @@ export const refreshToken = asyncHandler(async (req: Request, res: Response) => 
     data: { tokenExpiry, message: 'Token refreshed successfully' },
   });
 });
+
+/**
+ * POST /api/accounts/:id/analytics/sync
+ * Trigger an on-demand analytics sync for all POSTED posts on this account.
+ * Runs in the background — returns immediately so the UI stays responsive.
+ */
+export const triggerAnalyticsSync = asyncHandler(
+  async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+    const { id } = req.params;
+
+    const account = await prisma.linkedInAccount.findFirst({
+      where: { id, userId },
+      select: { id: true },
+    });
+
+    if (!account) throw new AppError('Account not found', 404);
+
+    // Fire and forget — analytics sync can take up to ~30s for large accounts
+    syncAnalyticsForAccount(id).catch((err) => {
+      console.error(
+        `[AnalyticsSync] On-demand sync error for account ${id}:`,
+        err instanceof Error ? err.message : String(err)
+      );
+    });
+
+    res.json({
+      success: true,
+      data: { message: 'Analytics sync started — refresh in ~30 seconds' },
+    });
+  }
+);
+
+/**
+ * GET /api/accounts/:id/status
+ * Returns real-time connection health: token validity + session validity.
+ * Computed fields so the frontend always has accurate state.
+ */
+export const getAccountStatus = asyncHandler(
+  async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+    const { id } = req.params;
+
+    const account = await prisma.linkedInAccount.findFirst({
+      where: { id, userId },
+      select: {
+        id: true,
+        tokenExpiry: true,
+        sessionValid: true,
+        lastSessionAt: true,
+        refreshToken: true,
+        dailyActionCount: true,
+        dailyActionLimit: true,
+        dailyActionReset: true,
+      },
+    });
+
+    if (!account) throw new AppError('Account not found', 404);
+
+    const now = new Date();
+    const isTokenExpired = account.tokenExpiry
+      ? account.tokenExpiry < now
+      : true; // no expiry stored → treat as expired
+    const canRefreshToken = !!account.refreshToken;
+
+    res.json({
+      success: true,
+      data: {
+        accountId: id,
+        isTokenExpired,
+        tokenExpiry: account.tokenExpiry,
+        canRefreshToken,
+        sessionValid: account.sessionValid,
+        lastSessionAt: account.lastSessionAt,
+        dailyActionCount: account.dailyActionCount,
+        dailyActionLimit: account.dailyActionLimit,
+      },
+    });
+  }
+);

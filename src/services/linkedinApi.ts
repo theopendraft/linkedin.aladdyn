@@ -39,6 +39,25 @@ export interface PostAnalytics {
   shares: number;
 }
 
+export class LinkedInApiError extends Error {
+  statusCode?: number;
+  isPermissionError: boolean;
+
+  constructor(
+    message: string,
+    options?: {
+      statusCode?: number;
+      isPermissionError?: boolean;
+      cause?: unknown;
+    }
+  ) {
+    super(message, { cause: options?.cause });
+    this.name = 'LinkedInApiError';
+    this.statusCode = options?.statusCode;
+    this.isPermissionError = options?.isPermissionError ?? false;
+  }
+}
+
 /**
  * Fetches the authenticated user's LinkedIn profile.
  */
@@ -169,15 +188,26 @@ export async function publishPost(params: {
 export async function getPostAnalytics(params: {
   accessToken: string;
   linkedinPostId: string;
+  organizationId: string;
 }): Promise<PostAnalytics> {
-  const { accessToken, linkedinPostId } = params;
+  const { accessToken, linkedinPostId, organizationId } = params;
 
   try {
-    // Encode the URN for use as a query param
-    const encodedShare = encodeURIComponent(linkedinPostId);
+    const organizationUrn = normalizeOrganizationUrn(organizationId);
+    const query = new URLSearchParams({
+      q: 'organizationalEntity',
+      organizationalEntity: organizationUrn,
+    });
+
+    // LinkedIn may return either share or ugcPost URNs as post identifiers.
+    if (linkedinPostId.includes(':ugcPost:')) {
+      query.append('ugcPosts[0]', linkedinPostId);
+    } else {
+      query.append('shares[0]', linkedinPostId);
+    }
 
     const res = await axios.get(
-      `${BASE_URL}/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodedShare}`,
+      `${BASE_URL}/organizationalEntityShareStatistics?${query.toString()}`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -196,24 +226,62 @@ export async function getPostAnalytics(params: {
       shares: element.shareCount ?? 0,
     };
   } catch (err) {
-    const message = extractApiError(err);
-    throw new Error(`Failed to fetch LinkedIn post analytics: ${message}`);
+    const { message, statusCode } = extractApiErrorDetails(err);
+    throw new LinkedInApiError(
+      `Failed to fetch LinkedIn post analytics: ${message}`,
+      {
+        statusCode,
+        isPermissionError: isPermissionError(statusCode, message),
+        cause: err,
+      }
+    );
   }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function extractApiError(err: unknown): string {
+function normalizeOrganizationUrn(organizationId: string): string {
+  return organizationId.startsWith('urn:li:organization:')
+    ? organizationId
+    : `urn:li:organization:${organizationId}`;
+}
+
+function extractApiErrorDetails(err: unknown): {
+  message: string;
+  statusCode?: number;
+} {
   if (err instanceof AxiosError) {
     const data = err.response?.data;
+    let message = err.message;
+
     if (data && typeof data === 'object') {
-      return (
+      message =
         (data as Record<string, unknown>)['message']?.toString() ??
-          (data as Record<string, unknown>)['error']?.toString() ??
-          JSON.stringify(data)
-      );
+        (data as Record<string, unknown>)['error']?.toString() ??
+        JSON.stringify(data);
     }
-    return err.message;
+
+    return {
+      message,
+      statusCode: err.response?.status,
+    };
   }
-  return err instanceof Error ? err.message : String(err);
+
+  return {
+    message: err instanceof Error ? err.message : String(err),
+  };
+}
+
+function isPermissionError(statusCode: number | undefined, message: string): boolean {
+  const normalizedMessage = message.toLowerCase();
+
+  return (
+    statusCode === 403 ||
+    normalizedMessage.includes('not enough permissions') ||
+    normalizedMessage.includes('insufficient permission')
+  );
+}
+
+function extractApiError(err: unknown): string {
+  return extractApiErrorDetails(err).message;
 }
