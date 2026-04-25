@@ -14,6 +14,7 @@ import { redisConnection } from '../redis';
 import { QUEUE_NAMES, EngagementJobData } from '../queues';
 import { scrapePostEngagements } from '../../services/engagementScraper';
 import { autoEnrollEngagedProfiles } from '../../services/sequenceEngine';
+import { emitLeadSignals } from '../../services/leadSignalEmitter';
 
 async function processEngagement(job: Job<EngagementJobData>): Promise<void> {
   const { postId, accountId } = job.data;
@@ -35,6 +36,12 @@ async function processEngagement(job: Job<EngagementJobData>): Promise<void> {
           `[EngagementWorker] Auto-enrolled ${enrolled} profiles into sequences for post ${postId}`
         );
       }
+
+      // Emit lead signals to server.aladdyn — fire-and-forget, never throws
+      emitLeadSignals(postId, accountId, result.likes, result.comments).catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[EngagementWorker] Lead signal emission failed for post ${postId}: ${msg}`);
+      });
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

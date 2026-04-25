@@ -26,7 +26,7 @@ const MAX_DAILY_ACTIONS = 30;
 async function checkDailyActionLimit(accountId: string): Promise<void> {
   const account = await prisma.linkedInAccount.findUnique({
     where: { id: accountId },
-    select: { dailyActionCount: true, lastActionDate: true },
+    select: { dailyActionCount: true, dailyActionReset: true },
   });
 
   if (!account) {
@@ -36,8 +36,8 @@ async function checkDailyActionLimit(accountId: string): Promise<void> {
   }
 
   const today = new Date().toDateString();
-  const lastActionDay = account.lastActionDate
-    ? new Date(account.lastActionDate).toDateString()
+  const lastActionDay = account.dailyActionReset
+    ? new Date(account.dailyActionReset).toDateString()
     : null;
 
   const currentCount =
@@ -54,11 +54,11 @@ async function incrementActionCount(accountId: string): Promise<void> {
   const today = new Date().toDateString();
   const account = await prisma.linkedInAccount.findUnique({
     where: { id: accountId },
-    select: { lastActionDate: true },
+    select: { dailyActionReset: true },
   });
 
-  const lastActionDay = account?.lastActionDate
-    ? new Date(account.lastActionDate).toDateString()
+  const lastActionDay = account?.dailyActionReset
+    ? new Date(account.dailyActionReset).toDateString()
     : null;
 
   if (lastActionDay === today) {
@@ -66,7 +66,7 @@ async function incrementActionCount(accountId: string): Promise<void> {
       where: { id: accountId },
       data: {
         dailyActionCount: { increment: 1 },
-        lastActionDate: new Date(),
+        dailyActionReset: new Date(),
       },
     });
   } else {
@@ -74,7 +74,7 @@ async function incrementActionCount(accountId: string): Promise<void> {
       where: { id: accountId },
       data: {
         dailyActionCount: 1,
-        lastActionDate: new Date(),
+        dailyActionReset: new Date(),
       },
     });
   }
@@ -99,8 +99,21 @@ export async function scrapePostEngagements(
 
   const linkedinPostId = post.linkedinPostId;
 
+  // Fetch encrypted session cookies for this account
+  const account = await prisma.linkedInAccount.findUnique({
+    where: { id: accountId },
+    select: { sessionCookies: true, sessionValid: true },
+  });
+
+  if (!account?.sessionCookies || !account.sessionValid) {
+    throw new Error(
+      `[EngagementScraper] No valid browser session for account ${accountId} — user must log in via session connect first`
+    );
+  }
+
   const result = await withSession(
     accountId,
+    account.sessionCookies,
     async function (session) {
       const { page } = session;
       const postUrl = `https://www.linkedin.com/feed/update/${linkedinPostId}/`;
@@ -212,7 +225,7 @@ export async function scrapePostEngagements(
 
   await incrementActionCount(accountId);
 
-  // Upsert profiles and create engagement records in a transaction
+  // Upsert profiles + create engagement records
   const allEngagers: Array<{ linkedinId: string; displayName: string; headline?: string }> = [
     ...result.likes,
     ...result.comments,
@@ -228,52 +241,55 @@ export async function scrapePostEngagements(
     }
   }
 
-  await prisma.$transaction(async function (tx) {
-    // Upsert all unique profiles
-    for (const [linkedinId, data] of uniqueEngagers) {
-      await tx.linkedInProfile.upsert({
-        where: { linkedinId },
-        create: {
-          linkedinId,
-          displayName: data.displayName,
-          headline: data.headline || '',
-          totalInteractions: 1,
-          lastScrapedAt: new Date(),
-        },
-        update: {
-          displayName: data.displayName,
-          headline: data.headline || undefined,
-          totalInteractions: { increment: 1 },
-        },
-      });
-    }
+  // Upsert profiles and collect their DB ids
+  const profileIdMap = new Map<string, string>(); // linkedinId → DB uuid
 
-    // Create engagement records for likes
-    for (const liker of result.likes) {
-      await tx.linkedInEngagement.create({
-        data: {
-          postId,
-          linkedinId: liker.linkedinId,
-          type: 'REACTION',
-          displayName: liker.displayName,
-          headline: liker.headline || '',
-        },
-      });
-    }
+  for (const [linkedinId, data] of uniqueEngagers) {
+    const profile = await prisma.linkedInProfile.upsert({
+      where: { linkedinId },
+      create: {
+        linkedinId,
+        displayName: data.displayName,
+        headline: data.headline || '',
+        totalInteractions: 1,
+        lastScrapedAt: new Date(),
+      },
+      update: {
+        displayName: data.displayName,
+        headline: data.headline || undefined,
+        totalInteractions: { increment: 1 },
+        lastInteractionAt: new Date(),
+      },
+      select: { id: true },
+    });
+    profileIdMap.set(linkedinId, profile.id);
+  }
 
-    // Create engagement records for comments
-    for (const commenter of result.comments) {
-      await tx.linkedInEngagement.create({
-        data: {
-          postId,
-          linkedinId: commenter.linkedinId,
-          type: 'COMMENT',
-          displayName: commenter.displayName,
-          headline: commenter.headline || '',
-          commentText: commenter.commentText,
-        },
-      });
-    }
+  // Build engagement records using profileId (DB uuid), skip duplicates on re-scrape
+  const likeData = result.likes
+    .map((liker) => {
+      const profileId = profileIdMap.get(liker.linkedinId);
+      if (!profileId) return null;
+      return { postId, profileId, type: 'LIKE' as const };
+    })
+    .filter((x): x is NonNullable<typeof x> => x !== null);
+
+  const commentData = result.comments
+    .map((commenter) => {
+      const profileId = profileIdMap.get(commenter.linkedinId);
+      if (!profileId) return null;
+      return {
+        postId,
+        profileId,
+        type: 'COMMENT' as const,
+        content: commenter.commentText || null,
+      };
+    })
+    .filter((x): x is NonNullable<typeof x> => x !== null);
+
+  await prisma.linkedInEngagement.createMany({
+    data: [...likeData, ...commentData],
+    skipDuplicates: true,
   });
 
   const totalScraped = result.likes.length + result.comments.length;

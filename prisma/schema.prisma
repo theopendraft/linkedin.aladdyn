@@ -235,7 +235,8 @@ model LinkedInEngagement {
   type    EngagementType
   content String? @db.Text // comment text if type=COMMENT
 
-  engagedAt DateTime @default(now())
+  engagedAt        DateTime  @default(now())
+  leadSignalSentAt DateTime? // timestamp when lead signal was emitted to server.aladdyn
 
   post    LinkedInPost    @relation(fields: [postId], references: [id], onDelete: Cascade)
   profile LinkedInProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
@@ -373,6 +374,10 @@ model LinkedInSequenceEnrollment {
   // Personalization context
   triggerPostTitle String?
 
+  // AI-suggested reply (populated when status = PENDING_APPROVAL)
+  suggestedMessage     String? @db.Text
+  serverConversationId String? // Conversation.id in server.aladdyn for cross-service linkage
+
   // Tracking
   lastMessageAt DateTime?
   nextStepAt    DateTime?
@@ -392,6 +397,7 @@ model LinkedInSequenceEnrollment {
 }
 
 enum EnrollmentStatus {
+  PENDING_APPROVAL // AI-suggested DM waiting for human approval in dashboard
   ACTIVE
   PAUSED
   COMPLETED

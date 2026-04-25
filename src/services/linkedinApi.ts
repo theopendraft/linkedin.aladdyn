@@ -182,8 +182,8 @@ export async function publishPost(params: {
 }
 
 /**
- * Fetches post-level analytics for a specific LinkedIn post.
- * Uses the Organization Share Statistics API.
+ * Fetches post-level analytics for a company page post.
+ * Uses the Organization Share Statistics API — requires orgId.
  */
 export async function getPostAnalytics(params: {
   accessToken: string;
@@ -234,6 +234,48 @@ export async function getPostAnalytics(params: {
         isPermissionError: isPermissionError(statusCode, message),
         cause: err,
       }
+    );
+  }
+}
+
+/**
+ * Fetches basic engagement counts for a personal post via /v2/socialActions.
+ * Returns reactions + comments only (impressions/clicks not available for personal posts).
+ * Falls back to zeros on permission errors — personal analytics scope is restricted.
+ */
+export async function getPersonalPostAnalytics(params: {
+  accessToken: string;
+  linkedinPostId: string;
+}): Promise<PostAnalytics> {
+  const { accessToken, linkedinPostId } = params;
+
+  try {
+    // Encode the URN for use in the path
+    const encodedUrn = encodeURIComponent(linkedinPostId);
+    const res = await axios.get(`${BASE_URL}/socialActions/${encodedUrn}`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'X-Restli-Protocol-Version': '2.0.0',
+      },
+    });
+
+    const data = res.data ?? {};
+    const reactions = data.likesSummary?.totalLikes ?? 0;
+    const comments = data.commentsSummary?.totalComments ?? 0;
+    const shares = data.sharesSummary?.totalShares ?? 0;
+
+    console.log(
+      `[LinkedInApi] socialActions for ${linkedinPostId}: reactions=${reactions} comments=${comments} shares=${shares} | raw=${JSON.stringify(data).slice(0, 200)}`
+    );
+
+    return { impressions: 0, clicks: 0, reactions, comments, shares };
+  } catch (err) {
+    const { message, statusCode } = extractApiErrorDetails(err);
+    // On 403/permission error throw a permission-flagged error so the caller can skip
+    // without writing zeros over real data
+    throw new LinkedInApiError(
+      `Personal post analytics unavailable (scope not granted): ${message}`,
+      { statusCode, isPermissionError: isPermissionError(statusCode, message) || true, cause: err }
     );
   }
 }

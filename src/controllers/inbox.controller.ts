@@ -286,3 +286,190 @@ export const triggerSync = asyncHandler(async (req: Request, res: Response) => {
     message: 'Inbox sync started. This may take a moment.',
   });
 });
+
+/**
+ * GET /api/inbox/pending-dms
+ * List all PENDING_APPROVAL sequence enrollments for accounts owned by this user.
+ * Used to display AI-suggested DMs awaiting human approval in the dashboard.
+ */
+export const listPendingDMs = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const { accountId } = req.query as Record<string, string>;
+
+  const accountFilter = accountId
+    ? { accountId, userId }
+    : { userId };
+
+  const enrollments = await prisma.linkedInSequenceEnrollment.findMany({
+    where: {
+      status: 'PENDING_APPROVAL',
+      sequence: {
+        account: accountFilter,
+      },
+    },
+    include: {
+      profile: {
+        select: {
+          id: true,
+          linkedinId: true,
+          displayName: true,
+          headline: true,
+          company: true,
+          jobTitle: true,
+          profileUrl: true,
+          avatarUrl: true,
+        },
+      },
+      sequence: {
+        select: {
+          id: true,
+          name: true,
+          accountId: true,
+        },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+
+  res.json({ success: true, data: enrollments });
+});
+
+/**
+ * POST /api/inbox/enrollment/:enrollmentId/approve
+ * Approve a PENDING_APPROVAL enrollment — optionally update the message — and
+ * send the DM immediately via browser session.
+ * Body: { message? } — if omitted, uses the AI-suggested message as-is.
+ */
+export const approvePendingDM = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const { enrollmentId } = req.params;
+  const { message: overrideMessage } = req.body as { message?: string };
+
+  const enrollment = await prisma.linkedInSequenceEnrollment.findFirst({
+    where: {
+      id: enrollmentId,
+      status: 'PENDING_APPROVAL',
+      sequence: {
+        account: { userId },
+      },
+    },
+    include: {
+      profile: { select: { linkedinId: true, displayName: true } },
+      sequence: {
+        include: {
+          account: {
+            select: {
+              id: true,
+              dailyActionCount: true,
+              dailyActionLimit: true,
+              dailyActionReset: true,
+            },
+          },
+        },
+      },
+      currentStep: true,
+    },
+  });
+
+  if (!enrollment) throw new AppError('Pending enrollment not found', 404);
+
+  const messageToSend =
+    overrideMessage?.trim() ||
+    enrollment.suggestedMessage ||
+    enrollment.currentStep?.template;
+
+  if (!messageToSend) {
+    throw new AppError('No message to send — provide a message in the request body', 400);
+  }
+
+  const account = enrollment.sequence.account;
+  const now = new Date();
+
+  // Check daily action limit
+  let currentCount = account.dailyActionCount;
+  if (!account.dailyActionReset || account.dailyActionReset < now) {
+    currentCount = 0;
+    await prisma.linkedInAccount.update({
+      where: { id: account.id },
+      data: {
+        dailyActionCount: 0,
+        dailyActionReset: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+      },
+    });
+  }
+
+  if (currentCount >= account.dailyActionLimit) {
+    throw new AppError(`Daily action limit (${account.dailyActionLimit}) reached`, 429);
+  }
+
+  // Send via browser session
+  await sendDM({
+    accountId: account.id,
+    participantLinkedInId: enrollment.profile.linkedinId,
+    message: messageToSend,
+  });
+
+  // Advance enrollment to ACTIVE (or COMPLETED if no further steps)
+  const nextStep = enrollment.currentStep
+    ? await prisma.linkedInSequenceStep.findFirst({
+        where: {
+          sequenceId: enrollment.sequenceId,
+          order: enrollment.currentStep.order + 1,
+        },
+      })
+    : null;
+
+  await prisma.linkedInSequenceEnrollment.update({
+    where: { id: enrollmentId },
+    data: {
+      status: nextStep ? 'ACTIVE' : 'COMPLETED',
+      suggestedMessage: messageToSend,
+      lastMessageAt: now,
+      ...(nextStep
+        ? {
+            currentStepId: nextStep.id,
+            nextStepAt: new Date(now.getTime() + nextStep.delayHours * 3600 * 1000),
+          }
+        : { completedAt: now }),
+    },
+  });
+
+  await prisma.linkedInAccount.update({
+    where: { id: account.id },
+    data: { dailyActionCount: { increment: 1 } },
+  });
+
+  res.json({
+    success: true,
+    message: `DM sent to ${enrollment.profile.displayName ?? enrollment.profile.linkedinId}`,
+    data: { enrollmentId, messageSent: messageToSend },
+  });
+});
+
+/**
+ * POST /api/inbox/enrollment/:enrollmentId/skip
+ * Dismiss a PENDING_APPROVAL enrollment without sending anything.
+ */
+export const skipPendingDM = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const { enrollmentId } = req.params;
+
+  const enrollment = await prisma.linkedInSequenceEnrollment.findFirst({
+    where: {
+      id: enrollmentId,
+      status: 'PENDING_APPROVAL',
+      sequence: { account: { userId } },
+    },
+    select: { id: true },
+  });
+
+  if (!enrollment) throw new AppError('Pending enrollment not found', 404);
+
+  await prisma.linkedInSequenceEnrollment.update({
+    where: { id: enrollmentId },
+    data: { status: 'PAUSED' },
+  });
+
+  res.json({ success: true, message: 'Suggestion dismissed' });
+});

@@ -16,6 +16,8 @@ import router from './routes/index';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { startPublishWorker } from './jobs/workers/publishWorker';
 import { startInboxSyncWorker } from './jobs/workers/inboxSyncWorker';
+import { startEngagementWorker } from './jobs/workers/engagementWorker';
+import { startAnalyticsWorker } from './jobs/workers/analyticsWorker';
 import { startInboxScheduler } from './jobs/scheduler';
 
 
@@ -87,12 +89,20 @@ app.listen(PORT, () => {
   console.log('  POST   /internal/inbox/process-replies      [x-internal-secret]');
   console.log('  POST   /internal/posts/publish-due          [x-internal-secret]');
   console.log('  POST   /internal/posts/create-from-social   [x-internal-secret]');
+  console.log('  POST   /internal/reply-suggestion           [x-internal-secret]');
+  console.log('  POST   /internal/posts/:postId/scrape-engagement [x-internal-secret]');
+  console.log('  POST   /internal/analytics/sync             [x-internal-secret]');
+  console.log('  GET    /api/inbox/pending-dms               [auth]');
+  console.log('  POST   /api/inbox/enrollment/:id/approve    [auth]');
+  console.log('  POST   /api/inbox/enrollment/:id/skip       [auth]');
   console.log();
 
   // Start workers — non-fatal if Redis is unavailable on boot
   try {
     startPublishWorker();
     startInboxSyncWorker();
+    startEngagementWorker();
+    startAnalyticsWorker();
     console.log('[Server] BullMQ workers started');
   } catch (err) {
     console.error(

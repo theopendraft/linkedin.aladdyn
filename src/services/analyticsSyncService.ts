@@ -54,7 +54,9 @@ export async function syncAnalyticsForAccount(
     accessToken = refreshed.accessToken;
   }
 
-  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+  const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+  const sixHoursAgo  = new Date(Date.now() - 6 * 60 * 60 * 1000);
+  const oneDayAgo    = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
   const posts = await prisma.linkedInPost.findMany({
     where: {
@@ -63,7 +65,20 @@ export async function syncAnalyticsForAccount(
       linkedinPostId: { not: null },
       OR: [
         { analyticsAt: null },
-        { analyticsAt: { lt: sixHoursAgo } },
+        // Posts published in the last 24h: re-sync every 30 min to catch new reactions quickly
+        {
+          AND: [
+            { createdAt: { gte: oneDayAgo } },
+            { analyticsAt: { lt: thirtyMinAgo } },
+          ],
+        },
+        // Older posts: 6-hour window is fine
+        {
+          AND: [
+            { createdAt: { lt: oneDayAgo } },
+            { analyticsAt: { lt: sixHoursAgo } },
+          ],
+        },
       ],
     },
     select: {
@@ -74,11 +89,12 @@ export async function syncAnalyticsForAccount(
     },
   });
 
-  if (!account.orgId) {
-    console.warn(
-      `[AnalyticsSync] Skipping analytics for account ${accountId}: missing organization ID`
+  const isPersonalAccount = !account.orgId;
+
+  if (isPersonalAccount) {
+    console.log(
+      `[AnalyticsSync] Account ${accountId} has no orgId — using personal post analytics (reactions/comments only)`
     );
-    return { synced: 0, failed: 0, skipped: posts.length };
   }
 
   let synced = 0;
@@ -88,17 +104,33 @@ export async function syncAnalyticsForAccount(
   const affectedCampaignIds = new Set<string>();
 
   for (const [index, post] of posts.entries()) {
-    if (!post.linkedinPostId || post.postAsPersonal) {
+    if (!post.linkedinPostId) {
       skipped++;
       continue;
     }
 
+    // Personal account posts: aggregate from our own LinkedInEngagement rows (no API scope needed).
+    // Org posts: use LinkedIn Organization Share Statistics API.
+    const usePersonal = isPersonalAccount || post.postAsPersonal;
+
     try {
-      const analytics = await getPostAnalytics({
-        accessToken,
-        linkedinPostId: post.linkedinPostId,
-        organizationId: account.orgId,
-      });
+      let analytics: { impressions: number; clicks: number; reactions: number; comments: number; shares: number };
+
+      if (usePersonal) {
+        // Aggregate engagement counts from Playwright-scraped rows
+        const [reactionCount, commentCount] = await Promise.all([
+          prisma.linkedInEngagement.count({ where: { postId: post.id, type: 'LIKE' } }),
+          prisma.linkedInEngagement.count({ where: { postId: post.id, type: 'COMMENT' } }),
+        ]);
+        analytics = { impressions: 0, clicks: 0, reactions: reactionCount, comments: commentCount, shares: 0 };
+        console.log(`[AnalyticsSync] Personal post ${post.id}: reactions=${reactionCount} comments=${commentCount} (from scraped engagements)`);
+      } else {
+        analytics = await getPostAnalytics({
+          accessToken,
+          linkedinPostId: post.linkedinPostId,
+          organizationId: account.orgId!,
+        });
+      }
 
       const engagementRate =
         analytics.impressions > 0
@@ -128,23 +160,17 @@ export async function syncAnalyticsForAccount(
 
       synced++;
     } catch (error) {
-      if (
-        error instanceof LinkedInApiError &&
-        error.isPermissionError
-      ) {
+      if (error instanceof LinkedInApiError && error.isPermissionError && !usePersonal) {
+        // Org analytics permission error — skip all remaining posts for this account
         const remaining = posts.length - index;
         skipped += remaining;
-
         console.warn(
           `[AnalyticsSync] Skipping remaining analytics for account ${accountId}: insufficient LinkedIn permissions (${error.message})`
         );
         break;
       }
 
-      console.error(
-        `[AnalyticsSync] Failed to sync post ${post.id}:`,
-        error
-      );
+      console.error(`[AnalyticsSync] Failed to sync post ${post.id}:`, error);
       failed++;
     }
 
